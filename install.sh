@@ -29,6 +29,17 @@ if [ -z "$platforms" ]; then
   exit 1
 fi
 
+IFS=',' read -ra selected <<< "$platforms"
+for p in "${selected[@]}"; do
+  case "$p" in
+    antigravity|claude-code|cursor|gemini-cli) ;;
+    *)
+      echo "unknown platform: $p (expected antigravity, claude-code, cursor or gemini-cli)" >&2
+      exit 2
+      ;;
+  esac
+done
+
 install_file() {  # src dest
   mkdir -p "$(dirname "$2")"
   cp -f "$1" "$2"
@@ -42,7 +53,6 @@ cp -R "$root/core" "$core_dest"
 find "$core_dest" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 echo "  -> $core_dest"
 
-IFS=',' read -ra selected <<< "$platforms"
 for p in "${selected[@]}"; do
   echo "Installing adapter: $p"
   case "$p" in
@@ -61,10 +71,6 @@ for p in "${selected[@]}"; do
       ;;
     gemini-cli)
       install_file "$root/adapters/gemini-cli/pr-review.toml" "$HOME/.gemini/commands/pr-review.toml"
-      ;;
-    *)
-      echo "  unknown platform: $p (expected antigravity, claude-code, cursor or gemini-cli)" >&2
-      exit 2
       ;;
   esac
 done
