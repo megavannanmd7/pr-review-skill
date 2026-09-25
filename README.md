@@ -102,9 +102,12 @@ running it against your own team's repo.
 /pr-review 842 paxiai-event-processor
 Review PR 842 in paxiai-event-processor
 Review PR 842 in jpteam/paxiai-event-processor --dry-run
+Review https://github.com/jpteam/paxiai-event-processor/pull/842
+Review jpteam/paxiai-event-processor#842
 ```
 
-The repo can be a bare name (resolved from your local clone's remote) or `owner/repo`.
+The repo can be a bare name (resolved from your local clone's remote), `owner/repo`,
+or you can just paste the PR URL — however you'd naturally share it.
 
 Add focus areas as plain text:
 
@@ -124,7 +127,12 @@ Review PR 842 in paxiai-event-processor
 Additional context: review-guidelines.md
 ```
 
-Flags: `--dry-run` (summarise, never post), `--max N` (cap findings, default 10).
+Flags: `--dry-run` (summarise, never post), `--max N` (cap findings, default 10),
+`--min-severity warning|suggestion|question|blocker` (default behaviour posts
+`blocker`/`warning` inline and puts `suggestion`/`question` in the summary only — say
+"show me everything" or pass `--min-severity question` to see all four inline),
+`--event REQUEST_CHANGES|APPROVE` (default `COMMENT`; only used if you ask for it),
+`--include-lockfiles` (lockfiles and generated/vendored files are skipped by default).
 
 ## What it does
 
@@ -186,24 +194,42 @@ Run `/pr-review 842 paxiai-event-processor` again with no new commits, and step 
 
 ## How deduplication works
 
-Three stages, no database and no local state — the PR itself is the source of truth.
+Two independent layers. The first is enforced by code, not just by the model's
+judgement — that's deliberate, so dedup doesn't silently degrade if the model phrases
+something differently on a rerun.
 
-1. **Fingerprint match.** Every comment the skill posts ends with a hidden marker,
-   `<!-- pr-review-skill:v1 fp=a1b2c3d4e5f6 -->`. The fingerprint is
-   `sha1(file | enclosing symbol | issue class)` — deliberately not the line number and
-   not the wording, so it survives new pushes and rebases. On a rerun, anything whose
-   fingerprint is already on the PR is dropped immediately. `core/scripts/pr_post.py`
-   re-checks this at post time, so a duplicate cannot slip through.
-2. **Semantic match.** Each remaining finding is compared against existing comments in
-   the same file, in the same hunk or within ~15 lines — human comments included. Same
-   underlying issue means no new comment, regardless of wording:
+1. **Named-duplicate match (primary, code-enforced).** `pr_fetch.py` tags every
+   existing comment, issue comment and review with a stable id (`rc:`/`ic:`/`rv:`).
+   When the review step finds a finding that matches one of them, it sets
+   `"duplicate_of_id": "rc:123456789"` on the finding. `pr_post.py` checks that id is
+   real and drops the finding — the skip happens in the script, not by hoping the
+   model remembers to leave it out. This is checked against every existing comment on
+   the PR, not just ones near the same line, so a general PR-level comment ("we're
+   migrating off Redis") can suppress a specific inline finding anywhere in the diff:
 
    > existing: *"This can fail when project is null."*
    > new: *"`project.id` is accessed without checking whether `project` exists."*
-   > → same issue, not posted.
+   > → same issue, `duplicate_of_id` set, not posted.
 
-3. **Resolved / outdated threads.** A match on a resolved or outdated thread is
-   reported as already handled and never reposted.
+   If the model names an id that turns out not to actually be on the PR, the claim is
+   ignored (not trusted blindly) and the finding posts normally — surfaced in the
+   result as `unverified_duplicate_claims`, so a bad claim can't silently suppress a
+   real finding.
+
+2. **Fingerprint match (secondary, fast-path).** Every comment the skill posts ends
+   with a hidden marker, `<!-- pr-review-skill:v1 fp=a1b2c3d4e5f6 -->`, built from
+   `sha1(file | enclosing symbol | issue class)`. On a rerun, anything whose
+   fingerprint is already on the PR is dropped automatically, without needing the
+   model to re-derive a `duplicate_of_id`. It's a weaker signal on its own — the
+   fingerprint changes if the model names the anchor or issue class differently next
+   time — so it backs up layer 1 rather than replacing it.
+
+**Resolved vs. outdated are not the same thing**, and the skill doesn't treat them the
+same. GitHub marks a thread `outdated` automatically the moment a new commit shifts
+the diff under it — whether or not the issue was actually fixed. Only a thread a human
+explicitly marked `resolved` is auto-suppressed; an `outdated`-but-unresolved thread is
+checked against the current code, and if the problem is still there, it's still
+raised.
 
 Reviewing the same PR twice with no new commits posts nothing.
 
@@ -228,9 +254,13 @@ every tool picks it up on the next run.
 
 `pr_fetch.py` and `pr_post.py` are plain Python 3, standard library only, and shell out
 to `gh`. They handle the mechanical parts that are easy to get wrong — pagination,
-mapping diff hunks to the lines GitHub will accept a comment on, thread resolution
-state, and batched review posting with a per-comment fallback. Judgement (the review
-and the semantic dedup) lives in `core/REVIEW.md`.
+mapping diff hunks to the lines GitHub will accept a comment on, a fallback to the
+whole-PR unified diff when GitHub omits a file's patch from the files endpoint (common
+on large diffs), thread resolution state, permission preflight, lockfile filtering,
+and batched review posting with a per-comment fallback. Judgement (the review itself,
+and picking which existing comment a finding duplicates) lives in `core/REVIEW.md`;
+`pr_post.py` enforces that judgement rather than trusting it blindly — see "How
+deduplication works" above.
 
 Both scripts are usable on their own:
 
@@ -261,8 +291,10 @@ Not yet covered, and why:
 | `gh is not installed or not on PATH` | `winget install --id GitHub.cli`, then open a new terminal |
 | `GitHub CLI is not authenticated` | `gh auth login` |
 | `HTTP 404` on a private repo | See the SSO / GitHub Enterprise notes under Install above |
+| `HTTP 403` when posting | Check `viewer_permission` in `bundle.json` — you need at least `write` on the repo |
 | The agent says it cannot find `REVIEW.md` | Re-run the installer; check `~/.pr-review-skill/core/REVIEW.md` exists |
-| Comment lands in the review body instead of inline | The line is outside the diff hunks; GitHub only accepts inline comments on changed lines |
+| Comment lands in the review body instead of inline | The line is outside the diff hunks; GitHub only accepts inline comments on changed lines. Full detail is still included, not just the title |
+| A finding you expected to see is missing | Check `below_severity` in the result — it may have been held back by `--min-severity`; pass `--min-severity question` to see everything |
 | Skill not offered by the tool | Re-run the installer and restart the tool; check the adapter path in the table above |
 
 ## Changing it

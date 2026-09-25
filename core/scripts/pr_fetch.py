@@ -10,13 +10,25 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 import subprocess
 import sys
 
+# Windows consoles default to a legacy codepage (cp1252); PR titles, comment bodies
+# and diffs routinely contain unicode (arrows, smart quotes, emoji), so force UTF-8
+# on our own stdout/stderr rather than let a print() crash mid-run.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 MARKER_RE = re.compile(r"<!--\s*pr-review-skill:v(\d+)\s+fp=([0-9a-f]{6,64})\s*-->")
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
 
 GRAPHQL_THREADS = """
 query($owner:String!,$name:String!,$number:Int!,$after:String){
@@ -35,6 +47,19 @@ query($owner:String!,$name:String!,$number:Int!,$after:String){
   }
 }
 """
+
+# Files that are almost never worth reviewing line-by-line: they are machine
+# generated, and reading their diffs burns context without producing findings.
+# Skipped, not deleted -- the path still shows up in `skipped_files` so the model
+# (and the human) can see what was left out and why.
+DEFAULT_SKIP_GLOBS = [
+    "*.lock", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "Cargo.lock",
+    "go.sum", "composer.lock", "poetry.lock", "Gemfile.lock", "Pipfile.lock",
+    "*.min.js", "*.min.css", "*.map", "*.generated.*",
+]
+# Directory names skipped at any depth (monorepo-safe -- "packages/x/dist/y.js" is
+# still caught, not just a top-level "dist/*").
+DEFAULT_SKIP_DIR_NAMES = {"dist", "build", "vendor", "node_modules"}
 
 
 class GhError(RuntimeError):
@@ -71,6 +96,23 @@ def check_auth() -> None:
             "  Run:  gh auth login   (GitHub.com -> HTTPS -> login with a browser)\n\n"
             + str(exc)
         ) from None
+
+
+def check_permission(owner: str, name: str) -> str:
+    """The authenticated user's permission level on the repo (admin/write/read/none).
+
+    Checked once up front so a lack of write access surfaces before the model spends
+    time reviewing a PR it will fail to comment on.
+    """
+    try:
+        me = gh_json("api", "user")
+        login = me.get("login") if me else None
+        if not login:
+            return "unknown"
+        perm = gh_json("api", f"repos/{owner}/{name}/collaborators/{login}/permission")
+        return (perm or {}).get("permission", "unknown")
+    except GhError:
+        return "unknown"  # non-fatal: some hosts/orgs restrict this endpoint even with valid access
 
 
 def paginate(path: str, per_page: int = 100, max_pages: int = 20) -> list:
@@ -136,6 +178,64 @@ def parse_patch(patch):
     return hunks, {"RIGHT": right, "LEFT": left}
 
 
+def fetch_unified_diff_patches(repo: str, number: int) -> dict:
+    """Fallback source of per-file patches when the files-list endpoint omits one.
+
+    GitHub's `/pulls/{n}/files` leaves `patch` null for very large diffs. The
+    whole-PR unified diff (`Accept: application/vnd.github.v3.diff`) doesn't have
+    that limit, so we fetch it once and slice out the hunks for whichever files
+    need them -- in the same "hunks-only" shape `files[].patch` normally has, so
+    parse_patch() doesn't need to know the difference.
+    """
+    try:
+        text = gh(
+            "api", f"repos/{repo}/pulls/{number}",
+            "-H", "Accept: application/vnd.github.v3.diff",
+        )
+    except GhError:
+        return {}
+
+    patches: dict = {}
+    path = None
+    lines: list = []
+    in_hunks = False
+
+    def flush():
+        if path and lines:
+            patches[path] = "\n".join(lines)
+
+    for raw in text.split("\n"):
+        m = DIFF_GIT_RE.match(raw)
+        if m:
+            flush()
+            path = m.group(2)
+            lines = []
+            in_hunks = False
+            continue
+        if raw.startswith("@@"):
+            in_hunks = True
+        if in_hunks:
+            lines.append(raw)
+    flush()
+    return patches
+
+
+def is_skippable(path: str, extra_globs) -> bool:
+    if not extra_globs:
+        return False
+    parts = path.split("/")
+    if DEFAULT_SKIP_DIR_NAMES.intersection(parts):
+        return True
+    # Bare-filename patterns like "pnpm-lock.yaml" should also catch that file inside
+    # a subdirectory in a monorepo (frontend/pnpm-lock.yaml), not just at the repo
+    # root, so match on the basename too.
+    basename = parts[-1]
+    for pattern in extra_globs:
+        if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(basename, pattern):
+            return True
+    return False
+
+
 def thread_state(owner: str, name: str, number: int) -> dict:
     """databaseId of each review comment -> {resolved, outdated} of its thread."""
     state: dict = {}
@@ -180,6 +280,10 @@ def main() -> int:
         "--max-patch-bytes", type=int, default=60000,
         help="truncate any single file patch longer than this (default 60000)",
     )
+    ap.add_argument(
+        "--include-lockfiles", action="store_true",
+        help="do not skip lockfiles/generated/vendored files (skipped by default)",
+    )
     args = ap.parse_args()
 
     if "/" not in args.repo:
@@ -189,6 +293,7 @@ def main() -> int:
     n = args.number
 
     check_auth()
+    permission = check_permission(owner, name)
 
     pr = gh_json("api", f"repos/{args.repo}/pulls/{n}")
     files_raw = paginate(f"repos/{args.repo}/pulls/{n}/files")
@@ -197,9 +302,27 @@ def main() -> int:
     reviews = paginate(f"repos/{args.repo}/pulls/{n}/reviews")
     threads = thread_state(owner, name, n)
 
+    skip_globs = [] if args.include_lockfiles else DEFAULT_SKIP_GLOBS
+    needs_fallback = any(
+        f.get("patch") is None and f["status"] != "removed" and not is_skippable(f["filename"], skip_globs)
+        for f in files_raw
+    )
+    fallback_patches = fetch_unified_diff_patches(args.repo, n) if needs_fallback else {}
+
     files = []
+    skipped_files = []
     for f in files_raw:
+        path = f["filename"]
+        if is_skippable(path, skip_globs):
+            skipped_files.append({"path": path, "reason": "lockfile/generated/vendored (default filter)"})
+            continue
+
         full_patch = f.get("patch")
+        used_fallback = False
+        if full_patch is None and path in fallback_patches:
+            full_patch = fallback_patches[path]
+            used_fallback = True
+
         patch = full_patch
         truncated = False
         if patch and len(patch) > args.max_patch_bytes:
@@ -207,17 +330,21 @@ def main() -> int:
             truncated = True
         hunks, commentable = parse_patch(full_patch)
         files.append({
-            "path": f["filename"],
+            "path": path,
             "previous_path": f.get("previous_filename"),
             "status": f["status"],
             "additions": f["additions"],
             "deletions": f["deletions"],
             "patch": patch,
             "patch_truncated": truncated,
-            "patch_omitted": full_patch is None,  # binary, or too large for the API
+            "patch_omitted": full_patch is None,  # binary, or unavailable from either source
+            "patch_fallback_used": used_fallback,
             "hunks": hunks,
             "commentable": commentable,
         })
+
+    def source_id(prefix: str, raw_id) -> str:
+        return f"{prefix}:{raw_id}"
 
     existing = []
     for c in review_comments:
@@ -226,7 +353,7 @@ def main() -> int:
         if line is None:
             line = c.get("original_line")
         existing.append({
-            "id": c["id"],
+            "id": source_id("rc", c["id"]),
             "path": c.get("path"),
             "line": line,
             "start_line": c.get("start_line") or c.get("original_start_line"),
@@ -264,11 +391,18 @@ def main() -> int:
         "changed_files": pr.get("changed_files"),
         "additions": pr.get("additions"),
         "deletions": pr.get("deletions"),
+        "viewer_permission": permission,  # admin/write/read/none/unknown
         "files": files,
+        "skipped_files": skipped_files,
         "existing": {
+            # A single flat list, each entry tagged with a stable "id" the model can
+            # reference verbatim in a finding's `duplicate_of_id` -- rc:/ic:/rv: are
+            # separate id namespaces (review comment / issue comment / review body),
+            # since GitHub's own numeric ids are not unique across them.
             "review_comments": existing,
             "issue_comments": [
                 {
+                    "id": source_id("ic", c["id"]),
                     "user": (c.get("user") or {}).get("login"),
                     "created_at": c.get("created_at"),
                     "body": c.get("body"),
@@ -277,6 +411,7 @@ def main() -> int:
             ],
             "reviews": [
                 {
+                    "id": source_id("rv", r["id"]),
                     "user": (r.get("user") or {}).get("login"),
                     "state": r.get("state"),
                     "submitted_at": r.get("submitted_at"),
@@ -294,9 +429,10 @@ def main() -> int:
         with open(args.out, "w", encoding="utf-8") as fh:
             fh.write(text)
         print(
-            f"PR #{n} {args.repo}: {len(files)} files, "
+            f"PR #{n} {args.repo}: {len(files)} files ({len(skipped_files)} skipped), "
             f"{len(existing)} existing inline comments, "
-            f"{len(posted)} previously posted by this skill -> {args.out}"
+            f"{len(posted)} previously posted by this skill, "
+            f"your permission: {permission} -> {args.out}"
         )
     else:
         print(text)
