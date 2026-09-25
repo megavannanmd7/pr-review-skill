@@ -1,9 +1,8 @@
----
-name: pr-review
-description: Reviews a GitHub pull request and posts only genuinely new, actionable findings as inline PR comments. Use when the user asks to review a pull request, for example "Review PR 842 in paxiai-event-processor", optionally with extra focus areas or a context .md file. Deduplicates against comments already on the PR, so the same PR can be reviewed repeatedly without repeating comments.
----
+# PR Review — the procedure
 
-# PR Review (inline, deduplicated)
+This is the platform-neutral core of the `pr-review` skill. Every adapter (Antigravity,
+Claude Code, Cursor, Gemini CLI) is a thin pointer at this file, so the review rubric and
+the dedup rules live here once and never drift between tools.
 
 Review a GitHub PR and post only findings that are **new** and **actionable** as inline
 comments. Running this twice on an unchanged PR must post nothing.
@@ -11,10 +10,16 @@ comments. Running this twice on an unchanged PR must post nothing.
 Authentication is the local `gh` CLI. Never ask for, read, or create a Personal Access
 Token, and never print credentials.
 
+Throughout, `<CORE>` means the directory containing this file — normally
+`~/.pr-review-skill/core/` (`%USERPROFILE%\.pr-review-skill\core\` on Windows). The
+scripts are at `<CORE>/scripts/`. Use `python` or `python3`, whichever exists.
+
 ## Invocation
 
+The adapter passes you the user's arguments. They look like:
+
 ```
-/pr-review 842 paxiai-event-processor
+842 paxiai-event-processor
 Review PR 842 in paxiai-event-processor
 Review PR 842 in jpteam/paxiai-event-processor --dry-run
 ```
@@ -55,7 +60,7 @@ never in the user's repo.
 ## Step 2 — Fetch the PR
 
 ```
-python <skill>/scripts/pr_fetch.py <owner/repo> <number> --out <workdir>/bundle.json
+python <CORE>/scripts/pr_fetch.py <owner/repo> <number> --out <workdir>/bundle.json
 ```
 
 `bundle.json` contains PR metadata, the diff per file, `commentable` (the exact lines
@@ -208,7 +213,7 @@ Write the approved findings to `<workdir>/findings.json`:
 Then:
 
 ```
-python <skill>/scripts/pr_post.py <owner/repo> <number> \
+python <CORE>/scripts/pr_post.py <owner/repo> <number> \
     --findings <workdir>/findings.json --bundle <workdir>/bundle.json
 ```
 

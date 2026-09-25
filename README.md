@@ -1,10 +1,12 @@
-# pr-review — an Antigravity skill for reviewing GitHub PRs
+# pr-review — an AI skill for reviewing GitHub PRs
 
 Reviews a pull request and posts only **new**, actionable findings as inline PR
 comments. Run it on the same PR as many times as you like: it reads what is already on
 the PR first and stays quiet about anything that has already been raised.
 
 No Personal Access Token. Authentication is your own `gh` CLI login.
+
+Works in **Antigravity** (IDE + CLI), **Claude Code**, **Cursor**, and **Gemini CLI**.
 
 ## Install
 
@@ -19,26 +21,30 @@ python --version                      # 3.9 or newer, on PATH
 Then, from a clone of this repo:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\install.ps1     # Windows
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -All                       # Windows
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Platform claude-code,cursor
 ```
 
 ```bash
-./install.sh                                                # macOS / Linux
+./install.sh --all                                                                 # macOS / Linux
+./install.sh --platform claude-code,cursor
 ```
 
-That copies `skills/pr-review/` into both Antigravity skill locations:
+The installer puts the shared core in `~/.pr-review-skill/core/` and a small adapter in
+each tool's own directory:
 
-| Target | Path |
-| --- | --- |
-| Antigravity IDE | `~/.gemini/config/skills/pr-review/` |
-| Antigravity CLI | `~/.gemini/antigravity-cli/skills/pr-review/` |
+| Tool | Adapter lands at | Invoke with |
+| --- | --- | --- |
+| Antigravity IDE | `~/.gemini/config/skills/pr-review/SKILL.md` | `/pr-review` or plain English |
+| Antigravity CLI | `~/.gemini/antigravity-cli/skills/pr-review/SKILL.md` | `/pr-review` or plain English |
+| Claude Code | `~/.claude/skills/pr-review/SKILL.md` | `/pr-review` or plain English |
+| Cursor | `~/.cursor/commands/pr-review.md` | `/pr-review` |
+| Gemini CLI | `~/.gemini/commands/pr-review.toml` | `/pr-review` |
 
-Restart Antigravity afterwards. Re-run the installer whenever you pull changes to this
+Restart the tool afterwards. Re-run the installer whenever you pull changes to this
 repo.
 
 ## Use
-
-From the Antigravity chat or the CLI:
 
 ```
 /pr-review 842 paxiai-event-processor
@@ -106,7 +112,7 @@ Three stages, no database and no local state — the PR itself is the source of 
    `<!-- pr-review-skill:v1 fp=a1b2c3d4e5f6 -->`. The fingerprint is
    `sha1(file | enclosing symbol | issue class)` — deliberately not the line number and
    not the wording, so it survives new pushes and rebases. On a rerun, anything whose
-   fingerprint is already on the PR is dropped immediately. `scripts/pr_post.py`
+   fingerprint is already on the PR is dropped immediately. `core/scripts/pr_post.py`
    re-checks this at post time, so a duplicate cannot slip through.
 2. **Semantic match.** Each remaining finding is compared against existing comments in
    the same file, in the same hunk or within ~15 lines — human comments included. Same
@@ -124,26 +130,49 @@ Reviewing the same PR twice with no new commits posts nothing.
 ## Layout
 
 ```
-skills/pr-review/
-  SKILL.md              the procedure the agent follows
-  scripts/pr_fetch.py   PR metadata, diff, commentable lines, existing threads -> bundle.json
-  scripts/pr_post.py    findings.json -> one batched inline review (with fallbacks)
+core/                       installed once to ~/.pr-review-skill/core/
+  REVIEW.md                 the procedure, review rubric and dedup rules
+  scripts/pr_fetch.py       PR metadata, diff, commentable lines, existing threads -> bundle.json
+  scripts/pr_post.py        findings.json -> one batched inline review (with fallbacks)
+adapters/
+  antigravity/SKILL.md      each adapter is ~30 lines: frontmatter in that tool's
+  claude-code/SKILL.md      format, a pointer to core/REVIEW.md, and the invariants
+  cursor/pr-review.md       that must hold even if REVIEW.md cannot be read
+  gemini-cli/pr-review.toml
 install.ps1 / install.sh
 ```
+
+The rubric and the scripts exist exactly once per machine. Adapters never contain
+review logic, so the tools cannot drift apart — fix a rule in `core/REVIEW.md` and
+every tool picks it up on the next run.
 
 `pr_fetch.py` and `pr_post.py` are plain Python 3, standard library only, and shell out
 to `gh`. They handle the mechanical parts that are easy to get wrong — pagination,
 mapping diff hunks to the lines GitHub will accept a comment on, thread resolution
 state, and batched review posting with a per-comment fallback. Judgement (the review
-and the semantic dedup) lives in `SKILL.md`.
+and the semantic dedup) lives in `core/REVIEW.md`.
 
 Both scripts are usable on their own:
 
 ```bash
-python skills/pr-review/scripts/pr_fetch.py jpteam/paxiai-event-processor 842 --out bundle.json
-python skills/pr-review/scripts/pr_post.py  jpteam/paxiai-event-processor 842 \
+python core/scripts/pr_fetch.py jpteam/paxiai-event-processor 842 --out bundle.json
+python core/scripts/pr_post.py  jpteam/paxiai-event-processor 842 \
     --findings findings.json --bundle bundle.json --dry-run
 ```
+
+## Adding another tool
+
+Nearly every AI coding tool now has a "reusable prompt triggered by a keyword"
+mechanism with shell access. To add one, copy an existing adapter, translate the
+frontmatter to that tool's format, and add a case to both installers. Do not copy the
+rubric into it.
+
+Not yet covered, and why:
+
+- **Codex CLI** — its custom-prompt mechanism is deprecated in favour of a skills
+  mechanism; needs a short spike to confirm the current folder and format.
+- **GitHub Copilot** (`.github/prompts/pr-review.prompt.md`) — works only in agent
+  mode, since ask and edit modes cannot run `gh` or Python.
 
 ## Troubleshooting
 
@@ -152,12 +181,13 @@ python skills/pr-review/scripts/pr_post.py  jpteam/paxiai-event-processor 842 \
 | `gh is not installed or not on PATH` | `winget install --id GitHub.cli`, then open a new terminal |
 | `GitHub CLI is not authenticated` | `gh auth login` |
 | `HTTP 404` on a private repo | Your `gh` account lacks access, or `gh auth refresh -s repo` is needed |
+| The agent says it cannot find `REVIEW.md` | Re-run the installer; check `~/.pr-review-skill/core/REVIEW.md` exists |
 | Comment lands in the review body instead of inline | The line is outside the diff hunks; GitHub only accepts inline comments on changed lines |
-| Skill not offered in Antigravity | Re-run the installer and restart Antigravity; check `~/.gemini/config/skills/pr-review/SKILL.md` exists |
+| Skill not offered by the tool | Re-run the installer and restart the tool; check the adapter path in the table above |
 
 ## Changing it
 
-Edit `skills/pr-review/SKILL.md` (procedure, review rubric, dedup rules) or the scripts,
-commit, and have everyone re-run the installer. If you change how fingerprints are
-built, bump `MARKER_VERSION` in `pr_post.py` — old markers will no longer match and
-previously posted findings can be raised again.
+Edit `core/REVIEW.md` (procedure, review rubric, dedup rules) or the scripts, commit,
+and have everyone re-run the installer. If you change how fingerprints are built, bump
+`MARKER_VERSION` in `pr_post.py` — old markers will no longer match and previously
+posted findings can be raised again.
