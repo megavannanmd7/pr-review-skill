@@ -57,8 +57,19 @@ Flags, forwarded to the scripts in Step 2 and Step 7:
 
 ## Step 0 — Preflight
 
-1. Run `gh auth status`. If `gh` is missing or unauthenticated, stop and tell the user
-   exactly this, then end the turn:
+1. Run `python <CORE>/scripts/pr_fetch.py --check-auth`. **Do not run a raw `gh auth
+   status` shell command yourself instead** — that trusts whatever `PATH` your own
+   shell/session happened to inherit, and if `gh` was installed *after* this session
+   started (routine right after `winget install`/`brew install`), that PATH is stale
+   and a bare `gh` lookup fails even though `gh` is genuinely installed and
+   authenticated. `pr_fetch.py --check-auth` also checks well-known install
+   locations directly on disk, which sidesteps that problem entirely.
+
+   If it exits non-zero, its message tells you which case it is — not found anywhere,
+   or found but not authenticated. Only tell the user to install `gh` if the message
+   actually says "not found"; if it says "not authenticated", the fix is `gh auth
+   login`, not a reinstall. Relay whichever command it actually asks for, then end the
+   turn:
 
    ```
    winget install --id GitHub.cli      # macOS: brew install gh   Linux: see cli.github.com

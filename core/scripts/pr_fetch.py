@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -66,16 +68,59 @@ class GhError(RuntimeError):
     pass
 
 
+# Well-known install locations, checked when a bare `gh` lookup fails. This exists
+# because PATH is a snapshot taken when a shell/process started: installing `gh` with
+# winget/brew *after* that happens (the single most common case -- install it, then
+# immediately try to use it in the same already-open terminal or agent session)
+# updates the registry/profile but not that process's already-inherited PATH. A shell
+# built into the same session genuinely cannot see it without a restart; a filesystem
+# check here can, because it never consults PATH at all.
+_KNOWN_GH_PATHS = [
+    # Windows
+    r"C:\Program Files\GitHub CLI\gh.exe",
+    r"C:\Program Files (x86)\GitHub CLI\gh.exe",
+    os.path.expandvars(r"%LocalAppData%\Programs\GitHub CLI\gh.exe"),
+    os.path.expandvars(r"%LocalAppData%\Microsoft\WinGet\Links\gh.exe"),
+    os.path.expanduser(r"~\scoop\shims\gh.exe"),
+    os.path.expandvars(r"%ChocolateyInstall%\bin\gh.exe"),
+    # macOS
+    "/opt/homebrew/bin/gh", "/usr/local/bin/gh",
+    # Linux
+    "/usr/bin/gh", "/usr/local/bin/gh", "/snap/bin/gh", os.path.expanduser("~/.local/bin/gh"),
+]
+
+_resolved_gh = None  # cached for the life of this process
+
+
+def resolve_gh() -> str | None:
+    """Absolute path to `gh`, or None if it truly can't be found anywhere.
+
+    Checks PATH first (the normal case), then known install locations (the stale-PATH
+    case). Never trust a bare "not found" from PATH alone to mean "not installed".
+    """
+    global _resolved_gh
+    if _resolved_gh:
+        return _resolved_gh
+    found = shutil.which("gh")
+    if not found:
+        found = next((p for p in _KNOWN_GH_PATHS if p and os.path.isfile(p)), None)
+    _resolved_gh = found
+    return found
+
+
 def gh(*args: str) -> str:
+    binary = resolve_gh() or "gh"
     try:
         proc = subprocess.run(
-            ["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
+            [binary, *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
         )
     except FileNotFoundError:
         raise GhError(
-            "`gh` is not installed or not on PATH.\n"
+            "`gh` is not installed (checked PATH and common install locations).\n"
             "  Install:  winget install --id GitHub.cli\n"
-            "  Sign in:  gh auth login"
+            "  Sign in:  gh auth login\n"
+            "  If you just installed it, this may still be a stale PATH in *this*\n"
+            "  process -- opening a new terminal / restarting the tool usually fixes it."
         ) from None
     if proc.returncode != 0:
         raise GhError("gh " + " ".join(args) + " failed:\n" + (proc.stderr or "").strip())
@@ -354,8 +399,8 @@ def fingerprints_in(body) -> list:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fetch a GitHub PR as one JSON bundle.")
-    ap.add_argument("repo", help="owner/repo")
-    ap.add_argument("number", type=int, help="pull request number")
+    ap.add_argument("repo", nargs="?", help="owner/repo")
+    ap.add_argument("number", type=int, nargs="?", help="pull request number")
     ap.add_argument("--out", help="write the bundle here instead of stdout")
     ap.add_argument(
         "--max-patch-bytes", type=int, default=60000,
@@ -365,8 +410,34 @@ def main() -> int:
         "--include-lockfiles", action="store_true",
         help="do not skip lockfiles/generated/vendored files (skipped by default)",
     )
+    ap.add_argument(
+        "--check-auth", action="store_true",
+        help="just verify gh is found and authenticated, then exit (no repo/number needed)",
+    )
     args = ap.parse_args()
 
+    if args.check_auth:
+        binary = resolve_gh()
+        if not binary:
+            print(
+                "gh: not found on PATH or in any known install location.\n"
+                "  Install:  winget install --id GitHub.cli   # macOS: brew install gh\n"
+                "  Sign in:  gh auth login",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            check_auth()
+        except GhError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"gh: {binary}")
+        print("auth: OK")
+        return 0
+
+    if not args.repo or args.number is None:
+        print("repo and number are required unless --check-auth is passed", file=sys.stderr)
+        return 2
     if "/" not in args.repo:
         print("repo must be owner/repo, got " + repr(args.repo), file=sys.stderr)
         return 2

@@ -81,9 +81,11 @@ repo.
 ### Verify the install before trying it on a real PR
 
 ```bash
-gh auth status                                                    # confirms gh is logged in
-python ~/.pr-review-skill/core/scripts/pr_fetch.py --help         # confirms the core copied correctly
+python ~/.pr-review-skill/core/scripts/pr_fetch.py --check-auth   # confirms gh is found and logged in
 ```
+
+Use this instead of a raw `gh auth status` in a freshly-opened terminal or agent
+session — see the note below on why.
 
 Both should succeed with no errors. Then try one real, low-stakes fetch (this only
 reads — it posts nothing):
@@ -331,9 +333,19 @@ Not yet covered, and why:
 
 ## Troubleshooting
 
+**"gh isn't installed" right after you just installed it.** This used to be a real
+failure mode: if the agent runs a raw `gh auth status` in a terminal/session that was
+already open *before* `gh` was installed, that process inherited its `PATH` at
+startup and genuinely cannot see the new install without a restart — so it would
+(wrongly) report `gh` as missing. `pr_fetch.py --check-auth` (what Step 0 uses now)
+checks well-known install locations directly on disk instead of trusting `PATH` alone,
+so this no longer requires a restart. If you ever see the skill claim `gh` isn't
+installed, the fix is to make sure it's using `--check-auth` rather than a raw shell
+command — the two give different, more accurate results.
+
 | Symptom | Fix |
 | --- | --- |
-| `gh is not installed or not on PATH` | `winget install --id GitHub.cli`, then open a new terminal |
+| `gh is not installed (checked PATH and common install locations)` | It's genuinely not installed here: `winget install --id GitHub.cli` |
 | `GitHub CLI is not authenticated` | `gh auth login` |
 | `HTTP 404` on a private repo | See the SSO / GitHub Enterprise notes under Install above |
 | `HTTP 403` when posting | Check `viewer_permission` in `bundle.json` — you need at least `write` on the repo |

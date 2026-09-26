@@ -58,7 +58,7 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pr_fetch import GhError, gh_json, paginate, parse_patch, fingerprints_in  # noqa: E402
+from pr_fetch import GhError, gh_json, paginate, parse_patch, fingerprints_in, resolve_gh  # noqa: E402
 
 MARKER_VERSION = 1
 DISCLAIMER = "> \U0001F916 *AI-assisted review, posted via the [pr-review skill](https://github.com/pr-review-skill) under this account's own login.*"
@@ -72,13 +72,17 @@ SEVERITY_RANK = {"question": 0, "suggestion": 1, "warning": 2, "blocker": 3}
 
 
 def gh_with_input(args: list, payload: str) -> str:
+    binary = resolve_gh() or "gh"
     try:
         proc = subprocess.run(
-            ["gh", *args], capture_output=True, text=True, encoding="utf-8",
+            [binary, *args], capture_output=True, text=True, encoding="utf-8",
             errors="replace", input=payload,
         )
     except FileNotFoundError:
-        raise GhError("`gh` is not installed or not on PATH. Run: winget install --id GitHub.cli") from None
+        raise GhError(
+            "`gh` is not installed (checked PATH and common install locations). "
+            "Run: winget install --id GitHub.cli"
+        ) from None
     if proc.returncode != 0:
         raise GhError((proc.stderr or proc.stdout or "").strip())
     return proc.stdout
