@@ -151,21 +151,38 @@ git -C <clone> worktree add --detach <workdir>/wt refs/remotes/pr/<number>
 
 Never `checkout`, `stash`, or `reset` in the user's own working tree.
 
-**3d. Blast radius — required when the PR changes a declaration.** If any changed line
-alters or removes a function, method, class, type, or exported constant declaration,
-run:
+**3d. Blast radius — required whenever a local clone exists and the PR changes code.**
+Run it for any PR that changes a declaration *or* code inside a function, which is
+nearly every PR:
 
 ```
 python <CORE>/scripts/pr_impact.py --bundle <workdir>/bundle.json \
-    --clone <clone-or-workdir/wt> --out <workdir>/impact.json
+    --clone <clone> --ref refs/remotes/pr/<number> --out <workdir>/impact.json
 ```
 
-This lists call sites **outside** the PR's own files for every symbol whose
-declaration the PR changed or removed. This is not optional garnish: the most damaging
-PR bugs are invisible in the diff. A function that changes from returning `null` to
-throwing looks perfectly correct in isolation while breaking every caller that checks
-`if (!result)`. Read the sample call sites it reports and check whether they still
-hold under the new behaviour.
+Always pass `--ref` pointing at the PR head fetched above. Without it the script falls
+back to the bundle's `head_sha`, and if that commit isn't in the clone the body-change
+analysis is skipped (`body_analysis_skipped` says why). Never point it at the user's
+checked-out branch.
+
+This lists call sites **outside** the PR's own files for every symbol the PR touched.
+This is not optional garnish: the most damaging PR bugs are invisible in the diff. A
+function that changes from returning `null` to throwing looks perfectly correct in
+isolation while breaking every caller that checks `if (!result)`. Each symbol has a
+`kind`:
+
+- `removed` / `changed`: the declaration line itself was deleted or edited (rename,
+  signature change). Read the sample call sites and check they still hold.
+- `body_changed`: only the function's body changed. The change lines are in
+  `changed_lines`. `contract_signals` lists return/throw/raise/await/null-style words on
+  those lines, a hint for ranking and not evidence. **Decide from the diff first whether
+  the function's contract changed**: return values or nullability, errors thrown, sync
+  vs async, side effects, argument handling. Only if it did, read the callers. A
+  refactor that keeps the contract is not a finding, however many callers it has.
+  Don't go through callers hoping to find one.
+
+If `candidates_over_cap` is non-zero, the lowest-ranked body changes were not searched.
+Mention that in the summary for a large PR.
 
 Its output is a heuristic word-grep, not a compiler — a hit can be an unrelated symbol
 with the same name. Verify a call site by reading it before you report it. If no local

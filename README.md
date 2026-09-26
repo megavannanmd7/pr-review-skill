@@ -272,9 +272,12 @@ Two things also make the review better informed rather than just quieter:
 - **Blast radius is checked, not assumed.** The most dangerous PR bug is invisible in
   the diff: change `findUser` from returning `null` to throwing and the diff looks
   perfect while every caller doing `if (!user)` breaks. `pr_impact.py` greps a local
-  clone for call sites *outside* the PR's own files, for every symbol whose declaration
-  the PR changed or removed. It's a heuristic word-grep, not a compiler — it reports
-  places to check, and the rubric requires reading a call site before reporting it.
+  clone for call sites *outside* the PR's own files, both for symbols whose declaration
+  the PR changed or removed and for functions whose body changed while the declaration
+  line stayed the same. Each changed line is mapped to its enclosing function in the
+  file at the PR head. It's a heuristic word-grep, not a compiler: it reports places to
+  check. For a body-only change, the rubric first asks whether the function's contract
+  changed at all, and requires reading a call site before reporting it.
 
 ## Layout
 
@@ -284,13 +287,15 @@ core/                       installed once to ~/.pr-review-skill/core/
   scripts/pr_fetch.py       PR metadata, diff, commentable lines, commits, CI results,
                             existing threads -> bundle.json
   scripts/pr_impact.py      bundle.json + a local clone -> call sites outside the PR
-                            for every declaration it changed (blast radius)
+                            for every declaration or function body it changed
+                            (blast radius)
   scripts/pr_post.py        findings.json -> one batched inline review (with fallbacks)
 adapters/
   antigravity/SKILL.md      each adapter is ~30 lines: frontmatter in that tool's
   claude-code/SKILL.md      format, a pointer to core/REVIEW.md, and the invariants
   cursor/pr-review.md       that must hold even if REVIEW.md cannot be read
   gemini-cli/pr-review.toml
+tests/                      not installed; run with python -m unittest discover tests
 install.ps1 / install.sh
 ```
 
@@ -312,7 +317,8 @@ Both scripts are usable on their own:
 
 ```bash
 python core/scripts/pr_fetch.py  jpteam/paxiai-event-processor 842 --out bundle.json
-python core/scripts/pr_impact.py --bundle bundle.json --clone ../paxiai-event-processor
+python core/scripts/pr_impact.py --bundle bundle.json --clone ../paxiai-event-processor \
+    --ref refs/remotes/pr/842
 python core/scripts/pr_post.py   jpteam/paxiai-event-processor 842 \
     --findings findings.json --bundle bundle.json --dry-run
 ```
@@ -362,3 +368,6 @@ Edit `core/REVIEW.md` (procedure, review rubric, dedup rules) or the scripts, co
 and have everyone re-run the installer. If you change how fingerprints are built, bump
 `MARKER_VERSION` in `pr_post.py` — old markers will no longer match and previously
 posted findings can be raised again.
+
+Run `python -m unittest discover tests` after changing `pr_impact.py`. The tests build
+throwaway git repos and check what the script reports for each kind of change.
