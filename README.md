@@ -138,10 +138,12 @@ Flags: `--dry-run` (summarise, never post), `--max N` (cap findings, default 10)
 
 ```
 repo + PR number
-      -> fetch PR diff, existing comments and thread states (gh)
+      -> fetch PR diff, existing comments, commit messages and CI results (gh)
       -> read changed files at the PR head for real context
-      -> review
+      -> check who calls what this PR changed (blast radius)
+      -> review, with a concrete failure trigger required per finding
       -> deduplicate against what is already on the PR
+      -> self-check: try to refute each finding before reporting it
       -> show you a summary and wait
       -> post the approved findings as inline comments
 ```
@@ -233,12 +235,54 @@ raised.
 
 Reviewing the same PR twice with no new commits posts nothing.
 
+## How it keeps the noise down
+
+An AI reviewer's failure mode isn't missing bugs, it's confidently inventing them. Four
+rules in `core/REVIEW.md` exist specifically to make that harder:
+
+1. **Every finding must name a concrete failure trigger.** Not "filter might be
+   undefined" but "GET /documents with no `?filter=` → `JSON.parse(undefined)` throws
+   → 500". A model that has to name the triggering input has to go look for one, and
+   speculative findings die at that step.
+2. **Trace a caller before claiming a value can be null.** If middleware, a type, or a
+   validator guarantees `user.tier` is set, telling the author to add `?.` is asking
+   for dead code. No caller checked → it's a `question`, not a `warning`.
+3. **Check the convention before recommending a pattern.** If no sibling controller
+   has a try/catch, the framework is handling errors globally (NestJS `@Catch()`,
+   Express error middleware) and the comment is noise. A pattern absent *everywhere*
+   is an architecture question for the summary, not an inline nit.
+4. **Performance findings need a scale.** Sequential `await` in a loop is often
+   deliberate — rate limits, connection pools, ordering. `Promise.all` suggested into
+   a rate-limited API is how a review comment causes an outage.
+
+Plus a **self-refutation pass** before the summary: for each finding, could the author
+dismiss this immediately with context that wasn't checked? If it can't survive that,
+it's dropped. Dropping a shaky finding costs nothing; posting one costs the author's
+trust in every other finding.
+
+Two things also make the review better informed rather than just quieter:
+
+- **CI results are read, not guessed.** `pr_fetch.py` pulls check-run conclusions and
+  per-file annotations into the bundle, so real compiler and linter output is available
+  as evidence. The rubric forbids re-reporting anything CI already flagged, and forbids
+  claiming a build failure that isn't in `checks`. Nothing from the PR is executed
+  locally to get this — which matters for fork PRs.
+- **Blast radius is checked, not assumed.** The most dangerous PR bug is invisible in
+  the diff: change `findUser` from returning `null` to throwing and the diff looks
+  perfect while every caller doing `if (!user)` breaks. `pr_impact.py` greps a local
+  clone for call sites *outside* the PR's own files, for every symbol whose declaration
+  the PR changed or removed. It's a heuristic word-grep, not a compiler — it reports
+  places to check, and the rubric requires reading a call site before reporting it.
+
 ## Layout
 
 ```
 core/                       installed once to ~/.pr-review-skill/core/
-  REVIEW.md                 the procedure, review rubric and dedup rules
-  scripts/pr_fetch.py       PR metadata, diff, commentable lines, existing threads -> bundle.json
+  REVIEW.md                 the procedure, review rubric, evidence rules and dedup rules
+  scripts/pr_fetch.py       PR metadata, diff, commentable lines, commits, CI results,
+                            existing threads -> bundle.json
+  scripts/pr_impact.py      bundle.json + a local clone -> call sites outside the PR
+                            for every declaration it changed (blast radius)
   scripts/pr_post.py        findings.json -> one batched inline review (with fallbacks)
 adapters/
   antigravity/SKILL.md      each adapter is ~30 lines: frontmatter in that tool's
@@ -265,8 +309,9 @@ deduplication works" above.
 Both scripts are usable on their own:
 
 ```bash
-python core/scripts/pr_fetch.py jpteam/paxiai-event-processor 842 --out bundle.json
-python core/scripts/pr_post.py  jpteam/paxiai-event-processor 842 \
+python core/scripts/pr_fetch.py  jpteam/paxiai-event-processor 842 --out bundle.json
+python core/scripts/pr_impact.py --bundle bundle.json --clone ../paxiai-event-processor
+python core/scripts/pr_post.py   jpteam/paxiai-event-processor 842 \
     --findings findings.json --bundle bundle.json --dry-run
 ```
 
@@ -295,6 +340,8 @@ Not yet covered, and why:
 | The agent says it cannot find `REVIEW.md` | Re-run the installer; check `~/.pr-review-skill/core/REVIEW.md` exists |
 | Comment lands in the review body instead of inline | The line is outside the diff hunks; GitHub only accepts inline comments on changed lines. Full detail is still included, not just the title |
 | A finding you expected to see is missing | Check `below_severity` in the result — it may have been held back by `--min-severity`; pass `--min-severity question` to see everything |
+| Blast-radius step was skipped | It needs a local clone; the summary says so when there wasn't one. Clone the repo and re-run |
+| `pr_impact.py` reports an unrelated file | Expected — it's a word-grep, not a compiler. The rubric requires reading a call site before reporting it as a finding |
 | Skill not offered by the tool | Re-run the installer and restart the tool; check the adapter path in the table above |
 
 ## Changing it

@@ -236,6 +236,87 @@ def is_skippable(path: str, extra_globs) -> bool:
     return False
 
 
+def fetch_checks(repo: str, head_sha: str, max_annotations: int = 100) -> dict:
+    """CI results for the PR head, including per-file annotations.
+
+    A typechecker or linter has usually already run on this commit, and its real
+    output is far better evidence than an LLM imagining what a compiler would say.
+    Fetching it here is free and, unlike running the project's own build locally,
+    involves executing none of the PR's code -- which matters when the PR comes from
+    a fork.
+    """
+    out = {"state": "unknown", "runs": [], "annotations": [], "annotations_truncated": False}
+    try:
+        data = gh_json("api", f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100")
+    except GhError:
+        return out
+
+    runs = (data or {}).get("check_runs") or []
+    failing_ids = []
+    for r in runs:
+        conclusion = r.get("conclusion")
+        out["runs"].append({
+            "name": r.get("name"),
+            "status": r.get("status"),
+            "conclusion": conclusion,
+            "title": ((r.get("output") or {}).get("title") or "")[:200],
+            "summary_excerpt": ((r.get("output") or {}).get("summary") or "")[:500],
+        })
+        if conclusion in ("failure", "action_required", "timed_out") and (r.get("output") or {}).get("annotations_count"):
+            failing_ids.append((r["id"], r.get("name")))
+
+    conclusions = {r.get("conclusion") for r in runs}
+    if not runs:
+        out["state"] = "none"
+    elif conclusions & {"failure", "action_required", "timed_out"}:
+        out["state"] = "failure"
+    elif any(r.get("status") != "completed" for r in runs):
+        out["state"] = "pending"
+    else:
+        out["state"] = "success"
+
+    for run_id, run_name in failing_ids:
+        if len(out["annotations"]) >= max_annotations:
+            out["annotations_truncated"] = True
+            break
+        try:
+            anns = gh_json("api", f"repos/{repo}/check-runs/{run_id}/annotations?per_page=100") or []
+        except GhError:
+            continue
+        for a in anns:
+            if len(out["annotations"]) >= max_annotations:
+                out["annotations_truncated"] = True
+                break
+            out["annotations"].append({
+                "check_name": run_name,
+                "path": a.get("path"),
+                "start_line": a.get("start_line"),
+                "end_line": a.get("end_line"),
+                "level": a.get("annotation_level"),
+                "title": a.get("title"),
+                "message": (a.get("message") or "")[:1000],
+            })
+
+    # Older CI (Jenkins and friends) reports commit statuses rather than check runs.
+    if out["state"] in ("none", "unknown"):
+        try:
+            status = gh_json("api", f"repos/{repo}/commits/{head_sha}/status")
+            if status and status.get("state"):
+                out["state"] = status["state"]
+                for s in status.get("statuses") or []:
+                    out["runs"].append({
+                        "name": s.get("context"),
+                        "status": "completed",
+                        "conclusion": s.get("state"),
+                        "title": (s.get("description") or "")[:200],
+                        "summary_excerpt": "",
+                    })
+        except GhError:
+            pass
+
+    return out
+
+
 def thread_state(owner: str, name: str, number: int) -> dict:
     """databaseId of each review comment -> {resolved, outdated} of its thread."""
     state: dict = {}
@@ -300,7 +381,9 @@ def main() -> int:
     review_comments = paginate(f"repos/{args.repo}/pulls/{n}/comments")
     issue_comments = paginate(f"repos/{args.repo}/issues/{n}/comments")
     reviews = paginate(f"repos/{args.repo}/pulls/{n}/reviews")
+    commits_raw = paginate(f"repos/{args.repo}/pulls/{n}/commits")
     threads = thread_state(owner, name, n)
+    checks = fetch_checks(args.repo, pr["head"]["sha"])
 
     skip_globs = [] if args.include_lockfiles else DEFAULT_SKIP_GLOBS
     needs_fallback = any(
@@ -392,6 +475,17 @@ def main() -> int:
         "additions": pr.get("additions"),
         "deletions": pr.get("deletions"),
         "viewer_permission": permission,  # admin/write/read/none/unknown
+        # Commit messages carry the author's stated intent; a deliberate, documented
+        # behaviour change is not a bug, and knowing that avoids flagging it as one.
+        "commits": [
+            {
+                "sha": (c.get("sha") or "")[:12],
+                "message": ((c.get("commit") or {}).get("message") or "").strip()[:1000],
+                "author": ((c.get("commit") or {}).get("author") or {}).get("name"),
+            }
+            for c in commits_raw
+        ],
+        "checks": checks,
         "files": files,
         "skipped_files": skipped_files,
         "existing": {
@@ -432,6 +526,7 @@ def main() -> int:
             f"PR #{n} {args.repo}: {len(files)} files ({len(skipped_files)} skipped), "
             f"{len(existing)} existing inline comments, "
             f"{len(posted)} previously posted by this skill, "
+            f"CI: {checks['state']} ({len(checks['annotations'])} annotations), "
             f"your permission: {permission} -> {args.out}"
         )
     else:
