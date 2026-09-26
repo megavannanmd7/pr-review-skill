@@ -397,6 +397,40 @@ def fingerprints_in(body) -> list:
     return [m.group(2) for m in MARKER_RE.finditer(body or "")]
 
 
+# The skill's own section of the PR description sits between these two markers. Only
+# the text between them is ever rewritten; everything outside is the author's and is
+# preserved byte for byte.
+DESC_START_RE = re.compile(r"<!--\s*pr-review-skill:description:start(?:\s+sha=([0-9a-f]{7,40}))?\s*-->")
+DESC_END_RE = re.compile(r"<!--\s*pr-review-skill:description:end\s*-->")
+
+
+def split_description(body):
+    """Split a PR description into (before, generated, after, sha, intact).
+
+    `generated` is None when the skill has never written to this description. `intact`
+    is False when the markers are damaged (one missing, out of order, or repeated) --
+    the caller must then leave the description alone rather than guess where the
+    author's text starts.
+    """
+    body = body or ""
+    starts = list(DESC_START_RE.finditer(body))
+    ends = list(DESC_END_RE.finditer(body))
+    if not starts and not ends:
+        return body, None, "", None, True
+    if len(starts) != 1 or len(ends) != 1 or ends[0].start() < starts[0].end():
+        return body, None, "", None, False
+    st, en = starts[0], ends[0]
+    return body[: st.start()], body[st.end(): en.start()], body[en.end():], st.group(1), True
+
+
+def author_description(body) -> str:
+    """The PR description with the skill's own section removed: the author's words only."""
+    before, generated, after, _, intact = split_description(body)
+    if generated is None or not intact:
+        return (body or "").strip()
+    return (before.rstrip() + "\n\n" + after.lstrip()).strip()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fetch a GitHub PR as one JSON bundle.")
     ap.add_argument("repo", nargs="?", help="owner/repo")
@@ -529,12 +563,17 @@ def main() -> int:
     )
     posted = sorted({fp for body in all_bodies for fp in fingerprints_in(body)})
 
+    _, generated_desc, _, generated_sha, _ = split_description(pr.get("body"))
     bundle = {
         "repo": args.repo,
         "number": n,
         "url": pr.get("html_url"),
         "title": pr.get("title"),
-        "body": pr.get("body"),
+        # The author's own description. The skill's generated section (if an earlier
+        # run added one) is split out so it is never mistaken for the author's intent.
+        "body": author_description(pr.get("body")),
+        "generated_description": generated_desc,
+        "generated_description_sha": generated_sha,
         "author": (pr.get("user") or {}).get("login"),
         "state": pr.get("state"),
         "draft": pr.get("draft"),
