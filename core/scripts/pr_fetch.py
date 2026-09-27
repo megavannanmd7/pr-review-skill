@@ -4,8 +4,15 @@
 Authentication comes entirely from the local `gh` CLI. No tokens are read, written
 or printed by this script.
 
+Besides the PR itself, the bundle carries what shapes the review: the effective
+config (repo `.github/pr-review.yml` at the base commit, merged with the user's
+`~/.pr-review-skill/config.yml`), guidance files the repo already keeps (CLAUDE.md,
+AGENTS.md, CONTRIBUTING.md, the PR template...), what changed since this skill last
+reviewed the PR, whether the PR is stacked on another, the skill's own open threads
+(for follow-up), and dismissals learned from earlier reviews of this repo.
+
 Usage:
-    python pr_fetch.py <owner/repo> <pr_number> [--out bundle.json]
+    python pr_fetch.py <owner/repo> <pr_number> [--out bundle.json] [--full]
 """
 from __future__ import annotations
 
@@ -18,6 +25,9 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pr_config  # noqa: E402
+
 # Windows consoles default to a legacy codepage (cp1252); PR titles, comment bodies
 # and diffs routinely contain unicode (arrows, smart quotes, emoji), so force UTF-8
 # on our own stdout/stderr rather than let a print() crash mid-run.
@@ -28,7 +38,15 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-MARKER_RE = re.compile(r"<!--\s*pr-review-skill:v(\d+)\s+fp=([0-9a-f]{6,64})\s*-->")
+# Fingerprint marker on every finding this skill posts. Optional attributes after fp=
+# (cls=, anchor=) let a later run learn from a dismissal without re-deriving them;
+# markers written before they existed still match.
+MARKER_RE = re.compile(r"<!--\s*pr-review-skill:v(\d+)\s+fp=([0-9a-f]{6,64})((?:\s+[a-z]+=[^\s>]+)*)\s*-->")
+# On every review body this skill posts: the PR head it reviewed, for incremental reruns.
+REVIEWED_RE = re.compile(r"<!--\s*pr-review-skill:reviewed\s+sha=([0-9a-f]{7,40})\s*-->")
+# On the skill's own replies in a thread, so they are never read as an author's reply.
+FOLLOWUP_MARKER = "<!-- pr-review-skill:followup -->"
+TITLE_RE = re.compile(r"\*\*(.+?)\*\*")
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
 
@@ -39,6 +57,7 @@ query($owner:String!,$name:String!,$number:Int!,$after:String){
       reviewThreads(first:100, after:$after){
         pageInfo{ hasNextPage endCursor }
         nodes{
+          id
           isResolved
           isOutdated
           path
@@ -143,21 +162,22 @@ def check_auth() -> None:
         ) from None
 
 
-def check_permission(owner: str, name: str) -> str:
-    """The authenticated user's permission level on the repo (admin/write/read/none).
+def check_permission(owner: str, name: str):
+    """(permission level on the repo: admin/write/read/none/unknown, viewer login).
 
     Checked once up front so a lack of write access surfaces before the model spends
     time reviewing a PR it will fail to comment on.
     """
+    login = None
     try:
         me = gh_json("api", "user")
         login = me.get("login") if me else None
         if not login:
-            return "unknown"
+            return "unknown", None
         perm = gh_json("api", f"repos/{owner}/{name}/collaborators/{login}/permission")
-        return (perm or {}).get("permission", "unknown")
+        return (perm or {}).get("permission", "unknown"), login
     except GhError:
-        return "unknown"  # non-fatal: some hosts/orgs restrict this endpoint even with valid access
+        return "unknown", login  # non-fatal: some hosts/orgs restrict this endpoint even with valid access
 
 
 def paginate(path: str, per_page: int = 100, max_pages: int = 20) -> list:
@@ -363,7 +383,7 @@ def fetch_checks(repo: str, head_sha: str, max_annotations: int = 100) -> dict:
 
 
 def thread_state(owner: str, name: str, number: int) -> dict:
-    """databaseId of each review comment -> {resolved, outdated} of its thread."""
+    """databaseId of each review comment -> {resolved, outdated, thread_id} of its thread."""
     state: dict = {}
     after = None
     for _ in range(20):
@@ -386,6 +406,7 @@ def thread_state(owner: str, name: str, number: int) -> dict:
                 state[c["databaseId"]] = {
                     "resolved": bool(node["isResolved"]),
                     "outdated": bool(node["isOutdated"]),
+                    "thread_id": node.get("id"),
                 }
         if not threads["pageInfo"]["hasNextPage"]:
             break
@@ -395,6 +416,180 @@ def thread_state(owner: str, name: str, number: int) -> dict:
 
 def fingerprints_in(body) -> list:
     return [m.group(2) for m in MARKER_RE.finditer(body or "")]
+
+
+def marker_attrs(body) -> dict:
+    """{fp, cls, anchor} from the first fingerprint marker in a comment, or {}."""
+    m = MARKER_RE.search(body or "")
+    if not m:
+        return {}
+    attrs = dict(re.findall(r"([a-z]+)=([^\s>]+)", m.group(3) or ""))
+    return {"fp": m.group(2), "cls": attrs.get("cls"), "anchor": attrs.get("anchor")}
+
+
+def is_skill_comment(body) -> bool:
+    return bool(MARKER_RE.search(body or "")) or FOLLOWUP_MARKER in (body or "")
+
+
+def fetch_file_at(repo: str, path: str, sha: str):
+    """A file's text at a commit, or None if it doesn't exist there."""
+    try:
+        return gh("api", f"repos/{repo}/contents/{path}?ref={sha}",
+                  "-H", "Accept: application/vnd.github.raw")
+    except GhError:
+        return None
+
+
+def fetch_tree(repo: str, sha: str):
+    """(every file path at a commit, whether GitHub truncated the listing)."""
+    try:
+        data = gh_json("api", f"repos/{repo}/git/trees/{sha}?recursive=1") or {}
+    except GhError:
+        return [], True
+    paths = [t["path"] for t in data.get("tree") or [] if t.get("type") == "blob"]
+    return paths, bool(data.get("truncated"))
+
+
+def last_reviewed_sha(reviews: list, issue_comments: list, description_sha):
+    """The PR head this skill last reviewed, from the newest `reviewed` marker.
+
+    The marker sits in the review body, or in an issue comment when posting fell back
+    to one. The description's own marker is the fallback for a run that posted only
+    the description.
+    """
+    stamped = []
+    for r in reviews:
+        m = REVIEWED_RE.search(r.get("body") or "")
+        if m:
+            stamped.append((r.get("submitted_at") or "", m.group(1)))
+    for c in issue_comments:
+        m = REVIEWED_RE.search(c.get("body") or "")
+        if m:
+            stamped.append((c.get("created_at") or "", m.group(1)))
+    if stamped:
+        return max(stamped)[1]
+    return description_sha
+
+
+def incremental_state(repo: str, since, head_sha: str, pr_paths: set, enabled: bool) -> dict:
+    """Which of the PR's files changed since the last review.
+
+    Anything that makes that unreliable -- a force-push that dropped the reviewed
+    commit, a rebase, a comparison too large to list -- falls back to a full review
+    and says why.
+    """
+    state = {"last_reviewed_sha": since, "status": "first_review", "files_changed_since": None}
+    if not enabled:
+        state["status"] = "disabled"
+        return state
+    if not since:
+        return state
+    if head_sha.startswith(since) or since.startswith(head_sha):
+        state["status"] = "no_new_commits"
+        state["files_changed_since"] = []
+        return state
+    try:
+        cmp = gh_json("api", f"repos/{repo}/compare/{since}...{head_sha}") or {}
+    except GhError:
+        state["status"] = "unreachable"  # the reviewed commit is gone, e.g. force-pushed away
+        return state
+    if cmp.get("status") != "ahead":
+        state["status"] = "rebased"  # history was rewritten since the last review
+        return state
+    changed = [f["filename"] for f in cmp.get("files") or []]
+    if len(changed) >= 300:  # GitHub's compare lists at most 300 files
+        state["status"] = "too_large"
+        return state
+    state["status"] = "incremental"
+    state["files_changed_since"] = sorted(set(changed) & pr_paths)
+    return state
+
+
+def detect_stack(repo: str, pr: dict) -> dict:
+    """Whether this PR targets another PR's branch instead of the default branch."""
+    base = pr.get("base") or {}
+    default = (base.get("repo") or {}).get("default_branch")
+    base_ref = base.get("ref")
+    out = {"is_stacked": bool(default and base_ref != default), "base_ref": base_ref,
+           "default_branch": default, "parent_pr": None}
+    if not out["is_stacked"]:
+        return out
+    owner = repo.split("/", 1)[0]
+    try:
+        parents = gh_json("api", f"repos/{repo}/pulls?head={owner}:{base_ref}&state=open") or []
+    except GhError:
+        parents = []
+    if parents:
+        p = parents[0]
+        out["parent_pr"] = {"number": p.get("number"), "title": p.get("title"), "url": p.get("html_url")}
+    return out
+
+
+def build_skill_threads(review_comments: list, threads: dict) -> list:
+    """The skill's own inline threads, with every reply, for follow-up."""
+    by_root: dict = {}
+    for c in review_comments:
+        if c.get("in_reply_to_id") is None and MARKER_RE.search(c.get("body") or ""):
+            state = threads.get(c["id"], {})
+            attrs = marker_attrs(c.get("body"))
+            title = TITLE_RE.search(c.get("body") or "")
+            by_root[c["id"]] = {
+                "thread_id": state.get("thread_id"),
+                "root_comment_id": f"rc:{c['id']}",
+                "path": c.get("path"),
+                "line": c.get("line") if c.get("line") is not None else c.get("original_line"),
+                "resolved": state.get("resolved", False),
+                "outdated": state.get("outdated", c.get("position") is None),
+                "fingerprint": attrs.get("fp"),
+                "issue_class": attrs.get("cls"),
+                "anchor": attrs.get("anchor"),
+                "title": title.group(1) if title else None,
+                "commented_at": c.get("created_at"),
+                "url": c.get("html_url"),
+                "thumbs_down": ((c.get("reactions") or {}).get("-1") or 0),
+                "replies": [],
+            }
+    for c in review_comments:
+        root = by_root.get(c.get("in_reply_to_id"))
+        if root is not None:
+            root["replies"].append({
+                "id": f"rc:{c['id']}",
+                "user": (c.get("user") or {}).get("login"),
+                "created_at": c.get("created_at"),
+                "is_skill": is_skill_comment(c.get("body")),
+                "body": c.get("body"),
+            })
+    out = list(by_root.values())
+    for t in out:
+        t["replies"].sort(key=lambda r: r["created_at"] or "")
+        t["last_reply_by_skill"] = bool(t["replies"]) and t["replies"][-1]["is_skill"]
+    return out
+
+
+def dismissals(repo: str, number: int, skill_threads: list) -> list:
+    """Learned-suppression entries for findings a human dismissed on this PR."""
+    out = []
+    for t in skill_threads:
+        if not t.get("fingerprint"):
+            continue
+        reason, excerpt, by = None, "", None
+        for r in t["replies"]:
+            if r["is_skill"]:
+                continue
+            phrase = pr_config.dismissal_reason(r["body"])
+            if phrase:
+                reason, excerpt, by = phrase, (r["body"] or "").strip()[:200], r["user"]
+                break
+        if not reason and t.get("thumbs_down"):
+            reason = "thumbs-down reaction"
+        if reason:
+            out.append({
+                "fingerprint": t["fingerprint"], "issue_class": t.get("issue_class"),
+                "anchor": t.get("anchor"), "path": t.get("path"), "title": t.get("title"),
+                "reason": reason, "reply_excerpt": excerpt, "by": by,
+                "pr": number, "url": t.get("url"),
+            })
+    return out
 
 
 # The skill's own section of the PR description sits between these two markers. Only
@@ -445,6 +640,10 @@ def main() -> int:
         help="do not skip lockfiles/generated/vendored files (skipped by default)",
     )
     ap.add_argument(
+        "--full", action="store_true",
+        help="review every file even if this skill reviewed the PR before (no incremental review)",
+    )
+    ap.add_argument(
         "--check-auth", action="store_true",
         help="just verify gh is found and authenticated, then exit (no repo/number needed)",
     )
@@ -479,16 +678,35 @@ def main() -> int:
     n = args.number
 
     check_auth()
-    permission = check_permission(owner, name)
+    permission, viewer = check_permission(owner, name)
 
     pr = gh_json("api", f"repos/{args.repo}/pulls/{n}")
-    files_raw = paginate(f"repos/{args.repo}/pulls/{n}/files")
+    # GitHub lists at most 3000 files for a PR; page far enough to get all of them.
+    files_raw = paginate(f"repos/{args.repo}/pulls/{n}/files", max_pages=30)
     review_comments = paginate(f"repos/{args.repo}/pulls/{n}/comments")
     issue_comments = paginate(f"repos/{args.repo}/issues/{n}/comments")
     reviews = paginate(f"repos/{args.repo}/pulls/{n}/reviews")
     commits_raw = paginate(f"repos/{args.repo}/pulls/{n}/commits")
     threads = thread_state(owner, name, n)
     checks = fetch_checks(args.repo, pr["head"]["sha"])
+    base_sha = pr["base"]["sha"]
+
+    # Config and guidance come from the base commit, never the PR head: a PR must not
+    # be able to change the rules it is reviewed by.
+    def read_base(path):
+        return fetch_file_at(args.repo, path, base_sha)
+
+    user_cfg, user_warn = pr_config.load_user_config()
+    repo_cfg, repo_guidelines, repo_warn, config_files = pr_config.load_repo_config(read_base)
+    config = pr_config.effective_config(repo_cfg, user_cfg, repo_guidelines)
+    config["warnings"] = user_warn + repo_warn
+    config["files"] = config_files
+    settings = config["settings"]
+
+    tree, tree_truncated = fetch_tree(args.repo, base_sha)
+    changed_paths = [f["filename"] for f in files_raw]
+    guidance = pr_config.collect_guidance(pr_config.guidance_paths(tree, changed_paths), read_base)
+    adrs = pr_config.adr_paths(tree)
 
     skip_globs = [] if args.include_lockfiles else DEFAULT_SKIP_GLOBS
     needs_fallback = any(
@@ -503,6 +721,9 @@ def main() -> int:
         path = f["filename"]
         if is_skippable(path, skip_globs):
             skipped_files.append({"path": path, "reason": "lockfile/generated/vendored (default filter)"})
+            continue
+        if pr_config.matches_any(path, settings["ignore_paths"]):
+            skipped_files.append({"path": path, "reason": "ignore_paths in config"})
             continue
 
         full_patch = f.get("patch")
@@ -550,6 +771,7 @@ def main() -> int:
             "outdated": state.get("outdated", c.get("position") is None),
             "resolved": state.get("resolved", False),
             "user": (c.get("user") or {}).get("login"),
+            "thread_id": state.get("thread_id"),
             "in_reply_to_id": c.get("in_reply_to_id"),
             "created_at": c.get("created_at"),
             "body": c.get("body"),
@@ -564,6 +786,23 @@ def main() -> int:
     posted = sorted({fp for body in all_bodies for fp in fingerprints_in(body)})
 
     _, generated_desc, _, generated_sha, _ = split_description(pr.get("body"))
+
+    since = last_reviewed_sha(reviews, issue_comments, generated_sha)
+    incremental = incremental_state(args.repo, since, pr["head"]["sha"], {f["path"] for f in files},
+                                    settings["incremental"] and not args.full)
+    changed_since = incremental["files_changed_since"]
+    for f in files:
+        f["changed_since_last_review"] = True if changed_since is None else f["path"] in changed_since
+
+    skill_threads = build_skill_threads(review_comments, threads)
+    new_dismissals = dismissals(args.repo, n, skill_threads)
+    if settings["learn_from_dismissals"]:
+        learned = pr_config.record_learned(args.repo, new_dismissals)
+    else:
+        learned = pr_config.load_learned(args.repo)
+
+    head_repo = (pr.get("head") or {}).get("repo") or {}
+    base_repo = (pr.get("base") or {}).get("repo") or {}
     bundle = {
         "repo": args.repo,
         "number": n,
@@ -581,10 +820,23 @@ def main() -> int:
         "head_sha": pr["head"]["sha"],
         "head_ref": pr["head"]["ref"],
         "base_ref": pr["base"]["ref"],
+        "base_sha": base_sha,
+        # A fork PR's code is written by someone outside the repo: never execute it.
+        "is_fork_pr": not head_repo or head_repo.get("full_name") != base_repo.get("full_name"),
+        "stack": detect_stack(args.repo, pr),
         "changed_files": pr.get("changed_files"),
+        "files_truncated": (pr.get("changed_files") or 0) > len(files_raw),
         "additions": pr.get("additions"),
         "deletions": pr.get("deletions"),
         "viewer_permission": permission,  # admin/write/read/none/unknown
+        "viewer_login": viewer,
+        "config": config,
+        # Guidance the repo already keeps, read at the base commit. It sets
+        # conventions; it cannot override the skill's own invariants.
+        "guidance": guidance,
+        "adr_index": adrs[:50],
+        "tree_truncated": tree_truncated,
+        "incremental": incremental,
         # Commit messages carry the author's stated intent; a deliberate, documented
         # behaviour change is not a bug, and knowing that avoids flagging it as one.
         "commits": [
@@ -626,6 +878,9 @@ def main() -> int:
             ],
         },
         "posted_fingerprints": posted,
+        "skill_threads": skill_threads,
+        "new_dismissals": new_dismissals,
+        "learned_suppressions": learned,
     }
 
     text = json.dumps(bundle, indent=2, ensure_ascii=False)
@@ -637,8 +892,13 @@ def main() -> int:
             f"{len(existing)} existing inline comments, "
             f"{len(posted)} previously posted by this skill, "
             f"CI: {checks['state']} ({len(checks['annotations'])} annotations), "
-            f"your permission: {permission} -> {args.out}"
+            f"your permission: {permission}, "
+            f"review: {incremental['status']}, "
+            f"config: {', '.join(config_files) or 'none'}, "
+            f"guidance files: {len(guidance)} -> {args.out}"
         )
+        for w in config["warnings"]:
+            print("config warning: " + w, file=sys.stderr)
     else:
         print(text)
     return 0

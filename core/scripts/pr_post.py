@@ -19,15 +19,28 @@ written between two hidden markers at the top of the description, and the author
 text is kept exactly as it is below. A rerun rewrites only the text between the
 markers, so the section is replaced, never repeated.
 
+Three more things happen here, all enforced in code:
+  - Findings a human dismissed on an earlier PR of this repo ("intentional", "won't
+    fix", a thumbs-down) are skipped by fingerprint (`learned_suppressions` in the
+    bundle), unless --ignore-learned is passed.
+  - Anything that looks like a credential is redacted from every body before it
+    leaves this machine.
+  - `followups` reply to, or resolve, this skill's *own* earlier threads. Threads
+    started by anyone else are refused, and the skill never replies twice in a row.
+
 Usage:
     python pr_post.py <owner/repo> <pr_number> --findings findings.json \
         [--bundle bundle.json] [--dry-run] [--min-severity warning] [--event COMMENT] \
-        [--no-description]
+        [--no-description] [--ignore-learned]
 
 findings.json:
     {
       "summary": "optional markdown for the review body",
       "description": "optional markdown: what this PR changes, for the PR description",
+      "followups": [
+        {"thread_id": "PRRT_...", "action": "reply | resolve | reply_and_resolve",
+         "body": "markdown reply (for reply actions)"}
+      ],
       "findings": [
         {
           "path": "src/foo.ts",
@@ -66,7 +79,8 @@ for _stream in (sys.stdout, sys.stderr):
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pr_fetch import (  # noqa: E402
-    GhError, gh_json, paginate, parse_patch, fingerprints_in, resolve_gh, split_description,
+    FOLLOWUP_MARKER, GhError, gh, gh_json, paginate, parse_patch, fingerprints_in, resolve_gh,
+    split_description,
 )
 
 MARKER_VERSION = 1
@@ -78,6 +92,37 @@ SEVERITY_ICON = {
     "question": "⚪",
 }
 SEVERITY_RANK = {"question": 0, "suggestion": 1, "warning": 2, "blocker": 3}
+
+# Credential shapes that must never be echoed back into a PR, even inside a finding
+# about a leaked secret. Deliberately specific: a false redaction garbles a comment,
+# but a broad pattern would mangle ordinary hashes and ids.
+SECRET_PATTERNS = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),                     # AWS access key id
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),                    # GitHub tokens
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{50,}\b"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}\b"),                 # Slack
+    re.compile(r"\bsk-(?:ant-|proj-|live_|test_)?[A-Za-z0-9_-]{20,}\b"),  # OpenAI/Anthropic/Stripe style
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),                         # Google API key
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),  # JWT
+]
+GRAPHQL_RESOLVE = "mutation($id:ID!){ resolveReviewThread(input:{threadId:$id}){ thread{ isResolved } } }"
+
+
+def redact(text, counter: list):
+    """Replace credential-shaped strings with a placeholder; counter[0] counts them."""
+    if not text:
+        return text
+    for rx in SECRET_PATTERNS:
+        text, n = rx.subn("[redacted credential]", text)
+        counter[0] += n
+    return text
+
+
+def marker_value(value) -> str:
+    """A marker attribute must stay inside one HTML comment token."""
+    cleaned = re.sub(r"[^A-Za-z0-9_.:$#-]+", "_", str(value or ""))
+    return re.sub(r"-{2,}", "-", cleaned).strip("_-")[:80]  # "--" is not allowed inside a comment
 
 
 def gh_with_input(args: list, payload: str) -> str:
@@ -121,7 +166,12 @@ def compose_body(f: dict, fp: str) -> str:
     parts = [DISCLAIMER, "", head, "", (f.get("body") or "").strip()]
     if f.get("suggestion"):
         parts += ["", "```suggestion", f["suggestion"].rstrip("\n"), "```"]
-    parts += ["", f"<!-- pr-review-skill:v{MARKER_VERSION} fp={fp} -->"]
+    attrs = ""
+    if marker_value(f.get("issue_class")):
+        attrs += " cls=" + marker_value(f.get("issue_class"))
+    if marker_value(f.get("anchor")):
+        attrs += " anchor=" + marker_value(f.get("anchor"))
+    parts += ["", f"<!-- pr-review-skill:v{MARKER_VERSION} fp={fp}{attrs} -->"]
     return "\n".join(parts).strip() + "\n"
 
 
@@ -237,11 +287,23 @@ def main() -> int:
         "--no-description", action="store_true",
         help="leave the PR description untouched even if findings.json has a description",
     )
+    ap.add_argument(
+        "--ignore-learned", action="store_true",
+        help="post findings even if a human dismissed the same finding on an earlier PR",
+    )
     args = ap.parse_args()
 
     with open(args.findings, encoding="utf-8") as fh:
         payload = json.load(fh)
     findings = payload.get("findings") or []
+    bundle = {}
+    if args.bundle:
+        with open(args.bundle, encoding="utf-8") as fh:
+            bundle = json.load(fh)
+    learned = {} if args.ignore_learned else {
+        e["fingerprint"]: e for e in bundle.get("learned_suppressions") or [] if e.get("fingerprint")
+    }
+    redactions = [0]
 
     commentable, head_sha, already_posted, existing_ids = load_context(args.repo, args.number, args.bundle)
     min_rank = SEVERITY_RANK[args.min_severity]
@@ -278,12 +340,20 @@ def main() -> int:
             continue
         seen.add(fp)
 
+        if fp in learned:
+            e = learned[fp]
+            skipped_duplicate.append({
+                "title": f.get("title"), "path": f.get("path"), "matched_by": "learned_suppression",
+                "fingerprint": fp, "reason": e.get("reason"), "dismissed_on": e.get("url"),
+            })
+            continue
+
         severity = (f.get("severity") or "question").lower()
         if SEVERITY_RANK.get(severity, 0) < min_rank:
             below_severity.append({"title": f.get("title"), "path": f.get("path"), "line": f.get("line")})
             continue
 
-        body = compose_body(f, fp)
+        body = redact(compose_body(f, fp), redactions)
         path = f.get("path")
         side = (f.get("side") or "RIGHT").upper()
         line = f.get("line")
@@ -294,7 +364,8 @@ def main() -> int:
                 "title": f.get("title"), "path": path, "line": line, "side": side,
                 "reason": "file not in the diff" if path not in commentable
                           else "line is outside the diff hunks",
-                "body": f.get("body"), "suggestion": f.get("suggestion"),
+                "body": redact(f.get("body"), redactions),
+                "suggestion": redact(f.get("suggestion"), redactions),
             })
             continue
 
@@ -307,7 +378,7 @@ def main() -> int:
 
     body_parts = []
     if payload.get("summary"):
-        body_parts.append(payload["summary"].strip())
+        body_parts.append(redact(payload["summary"].strip(), redactions))
     if unanchored:
         body_parts.append(
             "**Findings that could not be anchored to the diff**\n\n"
@@ -321,10 +392,12 @@ def main() -> int:
     review_body = "\n\n---\n\n".join(body_parts)
     if review_body:
         review_body = DISCLAIMER + "\n\n" + review_body
+    has_content = bool(comments or review_body)
+    # Records which head was reviewed, so the next run can review only what's new.
+    reviewed_marker = f"<!-- pr-review-skill:reviewed sha={head_sha} -->"
+    review_body = (review_body + "\n\n" + reviewed_marker) if review_body else reviewed_marker
 
-    review = {"commit_id": head_sha, "event": args.event, "comments": comments}
-    if review_body:
-        review["body"] = review_body
+    review = {"commit_id": head_sha, "event": args.event, "comments": comments, "body": review_body}
 
     result = {
         "repo": args.repo,
@@ -338,6 +411,8 @@ def main() -> int:
         "unanchored": [{k: v for k, v in u.items() if k not in ("body", "suggestion")} for u in unanchored],
         "failed": [],
     }
+    followups, followup_results = plan_followups(payload.get("followups") or [], bundle, redactions)
+    result["followups"] = followup_results
 
     desc_text = (payload.get("description") or "").strip()
     new_description = None
@@ -350,26 +425,31 @@ def main() -> int:
         # edited it since the fetch, and writing a stale copy back would erase that.
         try:
             pr = gh_json("api", f"repos/{args.repo}/pulls/{args.number}")
-            new_description, status = merge_description(pr.get("body"), desc_text, head_sha)
+            new_description, status = merge_description(pr.get("body"), redact(desc_text, redactions), head_sha)
             result["description"] = {"status": status}
         except GhError as exc:
             # A description problem must never cost the review itself.
             result["description"] = {"status": "failed", "error": str(exc)[:300]}
             result["failed"].append({"path": "<pr description>", "error": str(exc)[:300]})
 
+    result["redacted_credentials"] = redactions[0]
+
     if args.dry_run:
         result["dry_run"] = True
         result["preview"] = comments
-        result["review_body"] = review_body
+        result["review_body"] = review_body if has_content else None
+        result["followups_preview"] = followups
         if new_description is not None:
             result["description"]["preview"] = new_description
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
 
-    if not comments and not review_body:
+    if not has_content:
         result["note"] = "no new review comments to post"
     else:
         post_review(args, review, comments, review_body, head_sha, result)
+
+    run_followups(args, followups, followup_results, result)
 
     if new_description is not None:
         try:
@@ -387,6 +467,58 @@ def main() -> int:
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
+
+
+def plan_followups(requested: list, bundle: dict, redactions: list):
+    """(actions to perform, per-request results). Only this skill's own threads qualify."""
+    threads = {t.get("thread_id"): t for t in bundle.get("skill_threads") or [] if t.get("thread_id")}
+    planned, results = [], []
+    for req in requested:
+        tid = req.get("thread_id")
+        action = req.get("action")
+        entry = {"thread_id": tid, "action": action}
+        t = threads.get(tid)
+        if t is None:
+            entry.update(status="refused", reason="not a thread started by this skill (or no --bundle given)")
+        elif action not in ("reply", "resolve", "reply_and_resolve"):
+            entry.update(status="refused", reason=f"unknown action {action!r}")
+        elif action != "resolve" and not (req.get("body") or "").strip():
+            entry.update(status="refused", reason="a reply needs a body")
+        elif action != "resolve" and t.get("last_reply_by_skill"):
+            entry.update(status="refused", reason="this skill already has the last word in this thread")
+        elif action == "resolve" and t.get("resolved"):
+            entry.update(status="skipped", reason="already resolved")
+        else:
+            entry["status"] = "planned"
+            body = None
+            if action != "resolve":
+                body = (DISCLAIMER + "\n\n" + redact(req["body"].strip(), redactions)
+                        + "\n\n" + FOLLOWUP_MARKER)
+            planned.append({"thread_id": tid, "action": action, "body": body,
+                            "root_comment_id": t["root_comment_id"].split(":", 1)[1],
+                            "resolve": action != "reply" and not t.get("resolved")})
+        results.append(entry)
+    return planned, results
+
+
+def run_followups(args, planned: list, results: list, result: dict) -> None:
+    by_tid = {r["thread_id"]: r for r in results if r.get("status") == "planned"}
+    for item in planned:
+        entry = by_tid[item["thread_id"]]
+        try:
+            if item["body"]:
+                gh_with_input(
+                    ["api", "--method", "POST",
+                     f"repos/{args.repo}/pulls/{args.number}/comments/{item['root_comment_id']}/replies",
+                     "--input", "-"],
+                    json.dumps({"body": item["body"]}),
+                )
+            if item["resolve"]:
+                gh("api", "graphql", "-f", "query=" + GRAPHQL_RESOLVE, "-f", "id=" + item["thread_id"])
+            entry["status"] = "done"
+        except GhError as exc:
+            entry.update(status="failed", error=str(exc)[:300])
+            result["failed"].append({"path": "<follow-up " + item["thread_id"] + ">", "error": str(exc)[:300]})
 
 
 def post_review(args, review: dict, comments: list, review_body: str, head_sha: str, result: dict) -> None:

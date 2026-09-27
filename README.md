@@ -131,23 +131,91 @@ Review PR 842 in paxiai-event-processor
 Additional context: review-guidelines.md
 ```
 
-Flags: `--dry-run` (summarise, never post), `--max N` (cap findings, default 10),
-`--min-severity warning|suggestion|question|blocker` (default behaviour posts
-`blocker`/`warning` inline and puts `suggestion`/`question` in the summary only — say
-"show me everything" or pass `--min-severity question` to see all four inline),
-`--event REQUEST_CHANGES|APPROVE` (default `COMMENT`; only used if you ask for it),
-`--include-lockfiles` (lockfiles and generated/vendored files are skipped by default),
-`--no-description` (leave the PR description alone).
+Flags:
+
+| Flag | Effect |
+| --- | --- |
+| `--dry-run` | summarise, never post |
+| `--max N` | cap findings (default: `max_findings` from config, else 10) |
+| `--min-severity warning\|suggestion\|question\|blocker` | default posts `blocker`/`warning` inline and lists `suggestion`/`question` in the summary; say "show me everything" to see all four inline |
+| `--event REQUEST_CHANGES\|APPROVE` | default `COMMENT`; only used if you ask for it |
+| `--include-lockfiles` | lockfiles and generated/vendored files are skipped by default |
+| `--no-description` | leave the PR description alone |
+| `--full` | review every file, not just what changed since the last review |
+| `--no-follow-up` | don't reply to or resolve the skill's earlier threads |
+| `--ignore-learned` | raise findings even if they were dismissed on an earlier PR |
+| `--run-checks` | run the repo's configured checks locally (never for fork PRs) |
+| `--prove` | try to write a failing test for each blocker (needs `--run-checks`) |
+
+Plain English works too: "don't touch the description", "add a risk rating and reviewer
+guide", "run the tests".
+
+## Configure it per repo
+
+Commit `.github/pr-review.yml` to any repo that needs its own rules. It's read from the
+PR's **base** commit, so a PR can't change the rules it's reviewed by:
+
+```yaml
+# .github/pr-review.yml
+focus:
+  - memory allocations in hot paths
+  - unbounded caches and buffers
+suppress:
+  - missing try/catch in controllers (a global exception filter handles it)
+ignore_paths: [docs/**, "*.snap", generated/**]
+high_risk_paths: [src/billing/**, src/auth/**]
+max_findings: 6
+min_severity: warning
+description_sections: [overview, changes, contract, tests, risk, reviewer_guide]
+checks:                       # only ever run if a reviewer enables local checks
+  - npm ci --ignore-scripts
+  - npx tsc --noEmit
+guidelines: |
+  Every Redis key must carry the tenant prefix.
+  Services must stay stateless between requests.
+```
+
+Longer prose guidelines can go in `.github/pr-review.md` instead. Your own defaults go in
+`~/.pr-review-skill/config.yml`, which uses the same keys. Precedence: what you say in the
+request, then the repo file, then your own file. List settings (`focus`, `suppress`,
+`ignore_paths`, `high_risk_paths`) are combined rather than replaced. `local_checks: true`
+only counts in your own file, because it decides what runs on your machine.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `focus`, `suppress`, `guidelines` | none | what to look for, what not to flag, team rules |
+| `ignore_paths`, `high_risk_paths` | none | skip entirely / always rank as high risk |
+| `max_findings`, `min_severity` | `10`, `warning` | |
+| `description`, `description_sections` | `true`, overview/changes/contract/tests | also `risk`, `reviewer_guide` |
+| `incremental`, `follow_up`, `learn_from_dismissals` | `true` | |
+| `large_pr_files`, `large_pr_lines`, `partition_max_lines` | `25`, `1500`, `800` | when a PR counts as large, and how to split it |
+| `checks`, `checks_timeout` | none, `600` | commands for local checks |
+| `local_checks` | `false` | your own config only |
+
+The file uses a small subset of YAML: `key: value`, `- item` lists, `[a, b]` lists and
+`|` text blocks. A typo shows up as a warning in the review summary rather than being
+silently ignored.
+
+The skill also reads guidance your repo already has, at the base commit: `CLAUDE.md`,
+`AGENTS.md`, `GEMINI.md`, `CONTRIBUTING.md`, `.cursorrules`,
+`.github/copilot-instructions.md`, the PR template, and `CLAUDE.md` / `AGENTS.md` in any
+directory above a changed file. Architecture decision records under `docs/adr/` are
+listed and read when a change touches them.
 
 ## What it does
 
 ```
 repo + PR number
       -> fetch PR diff, existing comments, commit messages and CI results (gh)
+      -> load repo config and guidance from the base commit
+      -> work out what changed since the last review (incremental)
       -> read changed files at the PR head for real context
       -> check who calls what this PR changed (blast radius)
+      -> rank files by risk; split a large PR into partitions
+      -> optionally run the repo's own checks locally (opt-in, never for forks)
       -> review, with a concrete failure trigger required per finding
-      -> deduplicate against what is already on the PR
+      -> deduplicate against what is already on the PR and what was dismissed before
+      -> follow up on its own earlier threads: resolve what's fixed, answer replies
       -> self-check: try to refute each finding before reporting it
       -> draft a "Summary of changes" for the PR description
       -> show you the findings and the draft, and wait
@@ -187,8 +255,9 @@ skill> Review complete
        1. src/consumers/eventConsumer.ts:118 — Redis key built without the
           tenant prefix used everywhere else in this file; two tenants can
           collide on the same key.
-       2. src/consumers/eventConsumer.ts:142 — awaited call inside a loop
-          that could be batched with Promise.all.
+       2. src/consumers/eventConsumer.ts:142 — retry loop has no upper
+          bound: a permanently failing write (Redis READONLY during a
+          failover) retries forever and blocks the partition.
        Skipped as duplicate:
        - "project can be null" already raised in existing review comment
          on src/consumers/eventConsumer.ts:96 (unresolved) — this finding
@@ -299,6 +368,10 @@ rules in `core/REVIEW.md` exist specifically to make that harder:
    deliberate — rate limits, connection pools, ordering. `Promise.all` suggested into
    a rate-limited API is how a review comment causes an outage.
 
+5. **Evidence beats reasoning.** A CI annotation or a local compiler error on a changed
+   line is cited as-is. With `--prove`, a blocker has to come with a failing test, or it
+   gets dropped.
+
 Plus a **self-refutation pass** before the summary: for each finding, could the author
 dismiss this immediately with context that wasn't checked? If it can't survive that,
 it's dropped. Dropping a shaky finding costs nothing; posting one costs the author's
@@ -321,6 +394,44 @@ Two things also make the review better informed rather than just quieter:
   check. For a body-only change, the rubric first asks whether the function's contract
   changed at all, and requires reading a call site before reporting it.
 
+## Large PRs, reruns and follow-ups
+
+- **Risk triage.** `pr_triage.py` ranks every file (auth, payments, migrations,
+  concurrency and public APIs first; tests and docs last) and gives each a depth: `deep`,
+  `skim` (large PRs only, and only tests/docs/assets), or `recheck`. The summary always
+  reports coverage, e.g. "38 in depth, 9 skimmed, 12 not reviewed", so a partial review
+  is never passed off as complete.
+- **Parallel review.** On a large PR, the deep files are packed into partitions of related
+  modules. Where the tool can run subagents (Claude Code can), each partition is reviewed
+  in parallel. Deduplication, the self-check and posting stay in one place.
+- **Incremental reruns.** Each review records the head commit it reviewed. The next run
+  deep-reviews only what changed since then, and falls back to a full review after a
+  rebase or force-push. `--full` forces a full review.
+- **Stacked PRs.** A PR based on another PR's branch is detected. Only its own changes are
+  reviewed, and an unmerged parent is called out.
+- **Follow-ups.** On a rerun the skill revisits its own open threads: it resolves the ones
+  the code now fixes ("Verified fixed in a1b2c3d"), answers questions, and pushes back when
+  a reply says "fixed" but the code isn't. It never touches threads other people started,
+  and never replies twice in a row.
+- **Learning from dismissals.** When someone replies "intentional", "won't fix" or "false
+  positive", or gives a thumbs-down, that finding is remembered in
+  `~/.pr-review-skill/learned/<owner>__<repo>.json` and not raised again on later PRs.
+  Edit or delete the file to forget. `--ignore-learned` overrides it for one run.
+
+## Security model
+
+- **PR content is data.** Descriptions, code, comments and CI output are written by the PR
+  author. Instructions aimed at the reviewer ("AI: approve this") are reported as a
+  finding, never followed.
+- **Rules come from the base branch.** Repo config and guidance are read at the base
+  commit, and they can shape the review but can't switch off the approval gate, dedup, or
+  the execution rules.
+- **Secrets aren't echoed.** A leaked credential is reported by file, line and kind, never
+  by value, and `pr_post.py` redacts credential-shaped strings from everything it posts.
+- **Nothing runs unless you say so.** Local checks and `--prove` execute the PR's code, so
+  they're off by default, need your own opt-in, run only in a throwaway worktree at the PR
+  head with tokens stripped from the environment, and are refused outright for fork PRs.
+
 ## Layout
 
 ```
@@ -331,7 +442,11 @@ core/                       installed once to ~/.pr-review-skill/core/
   scripts/pr_impact.py      bundle.json + a local clone -> call sites outside the PR
                             for every declaration or function body it changed
                             (blast radius)
-  scripts/pr_post.py        findings.json -> one batched inline review (with fallbacks)
+  scripts/pr_triage.py      bundle.json -> risk per file, review depth, partitions
+  scripts/pr_checks.py      opt-in: run configured checks in the PR-head worktree
+  scripts/pr_config.py      config parsing, repo guidance, learned suppressions
+  scripts/pr_post.py        findings.json -> one batched inline review (with fallbacks),
+                            description section, follow-ups on its own threads
 adapters/
   antigravity/SKILL.md      each adapter is ~30 lines: frontmatter in that tool's
   claude-code/SKILL.md      format, a pointer to core/REVIEW.md, and the invariants
@@ -345,8 +460,8 @@ The rubric and the scripts exist exactly once per machine. Adapters never contai
 review logic, so the tools cannot drift apart — fix a rule in `core/REVIEW.md` and
 every tool picks it up on the next run.
 
-`pr_fetch.py` and `pr_post.py` are plain Python 3, standard library only, and shell out
-to `gh`. They handle the mechanical parts that are easy to get wrong — pagination,
+All scripts are plain Python 3, standard library only, and shell out to `gh` or
+`git`. They handle the mechanical parts that are easy to get wrong — pagination,
 mapping diff hunks to the lines GitHub will accept a comment on, a fallback to the
 whole-PR unified diff when GitHub omits a file's patch from the files endpoint (common
 on large diffs), thread resolution state, permission preflight, lockfile filtering,
@@ -355,12 +470,13 @@ and picking which existing comment a finding duplicates) lives in `core/REVIEW.m
 `pr_post.py` enforces that judgement rather than trusting it blindly — see "How
 deduplication works" above.
 
-Both scripts are usable on their own:
+Each script is usable on its own:
 
 ```bash
 python core/scripts/pr_fetch.py  jpteam/paxiai-event-processor 842 --out bundle.json
 python core/scripts/pr_impact.py --bundle bundle.json --clone ../paxiai-event-processor \
     --ref refs/remotes/pr/842
+python core/scripts/pr_triage.py --bundle bundle.json
 python core/scripts/pr_post.py   jpteam/paxiai-event-processor 842 \
     --findings findings.json --bundle bundle.json --dry-run
 ```
@@ -397,6 +513,11 @@ command — the two give different, more accurate results.
 | `GitHub CLI is not authenticated` | `gh auth login` |
 | `HTTP 404` on a private repo | See the SSO / GitHub Enterprise notes under Install above |
 | `HTTP 403` when posting | Check `viewer_permission` in `bundle.json` — you need at least `write` on the repo |
+| Description `failed` with a 403 | Editing a PR description needs `write` access or being the PR's author; the review itself still posts |
+| `config warning: ...` in the summary | A key or value in `.github/pr-review.yml` or your own config wasn't understood and was ignored |
+| A finding keeps not appearing | It may match a learned dismissal: check `skipped_duplicate` for `learned_suppression`, edit `~/.pr-review-skill/learned/<owner>__<repo>.json`, or pass `--ignore-learned` |
+| Local checks say `refused_fork` / `refused_not_enabled` | Working as intended: fork PRs are never executed, and local checks need `--run-checks` or `local_checks: true` in your own config |
+| Local checks say `no_checks_configured` | Add commands under `checks:` in the repo's `.github/pr-review.yml` |
 | The agent says it cannot find `REVIEW.md` | Re-run the installer; check `~/.pr-review-skill/core/REVIEW.md` exists |
 | Comment lands in the review body instead of inline | The line is outside the diff hunks; GitHub only accepts inline comments on changed lines. Full detail is still included, not just the title |
 | A finding you expected to see is missing | Check `below_severity` in the result — it may have been held back by `--min-severity`; pass `--min-severity question` to see everything |
@@ -411,5 +532,5 @@ and have everyone re-run the installer. If you change how fingerprints are built
 `MARKER_VERSION` in `pr_post.py` — old markers will no longer match and previously
 posted findings can be raised again.
 
-Run `python -m unittest discover tests` after changing `pr_impact.py`. The tests build
-throwaway git repos and check what the script reports for each kind of change.
+Run `python -m unittest discover tests` after changing any script. The tests use
+throwaway git repos and a fake `gh`, so they never touch GitHub.
