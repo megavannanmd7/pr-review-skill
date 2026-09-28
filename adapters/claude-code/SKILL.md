@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Reviews a GitHub pull request and posts only genuinely new, actionable findings as inline PR comments. Use when the user asks to review a pull request, for example "Review PR 842 in paxiai-event-processor", optionally with extra focus areas or a context .md file. Deduplicates against comments already on the PR, so the same PR can be reviewed repeatedly without repeating comments.
+description: Reviews a GitHub pull request and posts only genuinely new, actionable findings as inline PR comments, plus a "Summary of changes" section at the top of the PR description that keeps the author's own text below it. Use when the user asks to review a pull request, for example "Review PR 842 in paxiai-event-processor", optionally with extra focus areas or a context .md file. Deduplicates against comments already on the PR, so the same PR can be reviewed repeatedly without repeating comments.
 ---
 
 # PR Review (inline, deduplicated)
@@ -29,5 +29,7 @@ installer from their clone of the pr-review-skill repo, and stop.
   anything. Reviewing the same PR twice must not repeat a comment.
 - Show the findings summary and **wait for the user's approval** before posting.
 - Anchor inline comments only to lines that appear in the diff.
+- Change the PR description only through `pr_post.py`, which rewrites nothing but
+  the skill's own marked section. Never alter or remove the author's text.
 - No style or formatting nits, and never restate what the code does.
 - Never `checkout`, `stash`, or `reset` in the user's working tree.

@@ -1,4 +1,4 @@
-description = "Review a GitHub PR and post only genuinely new findings as inline comments (deduplicated against existing PR comments)."
+description = "Review a GitHub PR and post only genuinely new findings as inline comments (deduplicated against existing PR comments), plus a summary of changes above the author's PR description."
 
 prompt = """
 Review a GitHub pull request and post only genuinely new, actionable findings as
@@ -30,6 +30,8 @@ Invariants, which hold even if you cannot read REVIEW.md:
   anything. Reviewing the same PR twice must not repeat a comment.
 - Show the findings summary and wait for the user's approval before posting.
 - Anchor inline comments only to lines that appear in the diff.
+- Change the PR description only through pr_post.py, which rewrites nothing but
+  the skill's own marked section. Never alter or remove the author's text.
 - No style or formatting nits, and never restate what the code does.
 - Never checkout, stash, or reset in the user's working tree.
 """

@@ -54,6 +54,9 @@ Flags, forwarded to the scripts in Step 2 and Step 7:
   invocation; never choose `REQUEST_CHANGES` or `APPROVE` on your own judgement.
 - `--include-lockfiles` — passed to `pr_fetch.py` if the user explicitly wants
   lockfiles/generated files reviewed (skipped by default, see Step 2).
+- `--no-description` — don't draft or write the "Summary of changes" section of the PR
+  description (Step 6b). Also honour plain-English equivalents ("don't touch the
+  description"). Passed to `pr_post.py`.
 
 ## Step 0 — Preflight
 
@@ -123,7 +126,10 @@ The diff alone is not enough to judge correctness. Four things to establish befo
 reviewing:
 
 **3a. Intent.** Read the PR title, body, and `commits[].message`. A behaviour change
-the author describes as deliberate is not a bug. If the PR says "findUser now throws
+the author describes as deliberate is not a bug. `body` is the author's own text only.
+`generated_description` is the section an earlier run of this skill wrote. It is your
+own output, not the author's intent, so never cite it as evidence of what the author
+meant. If the PR says "findUser now throws
 instead of returning null", do not report that as a defect — report the callers that
 weren't updated (see 3d).
 
@@ -151,21 +157,38 @@ git -C <clone> worktree add --detach <workdir>/wt refs/remotes/pr/<number>
 
 Never `checkout`, `stash`, or `reset` in the user's own working tree.
 
-**3d. Blast radius — required when the PR changes a declaration.** If any changed line
-alters or removes a function, method, class, type, or exported constant declaration,
-run:
+**3d. Blast radius — required whenever a local clone exists and the PR changes code.**
+Run it for any PR that changes a declaration *or* code inside a function, which is
+nearly every PR:
 
 ```
 python <CORE>/scripts/pr_impact.py --bundle <workdir>/bundle.json \
-    --clone <clone-or-workdir/wt> --out <workdir>/impact.json
+    --clone <clone> --ref refs/remotes/pr/<number> --out <workdir>/impact.json
 ```
 
-This lists call sites **outside** the PR's own files for every symbol whose
-declaration the PR changed or removed. This is not optional garnish: the most damaging
-PR bugs are invisible in the diff. A function that changes from returning `null` to
-throwing looks perfectly correct in isolation while breaking every caller that checks
-`if (!result)`. Read the sample call sites it reports and check whether they still
-hold under the new behaviour.
+Always pass `--ref` pointing at the PR head fetched above. Without it the script falls
+back to the bundle's `head_sha`, and if that commit isn't in the clone the body-change
+analysis is skipped (`body_analysis_skipped` says why). Never point it at the user's
+checked-out branch.
+
+This lists call sites **outside** the PR's own files for every symbol the PR touched.
+This is not optional garnish: the most damaging PR bugs are invisible in the diff. A
+function that changes from returning `null` to throwing looks perfectly correct in
+isolation while breaking every caller that checks `if (!result)`. Each symbol has a
+`kind`:
+
+- `removed` / `changed`: the declaration line itself was deleted or edited (rename,
+  signature change). Read the sample call sites and check they still hold.
+- `body_changed`: only the function's body changed. The change lines are in
+  `changed_lines`. `contract_signals` lists return/throw/raise/await/null-style words on
+  those lines, a hint for ranking and not evidence. **Decide from the diff first whether
+  the function's contract changed**: return values or nullability, errors thrown, sync
+  vs async, side effects, argument handling. Only if it did, read the callers. A
+  refactor that keeps the contract is not a finding, however many callers it has.
+  Don't go through callers hoping to find one.
+
+If `candidates_over_cap` is non-zero, the lowest-ranked body changes were not searched.
+Mention that in the summary for a large PR.
 
 Its output is a heuristic word-grep, not a compiler — a hit can be an unrelated symbol
 with the same name. Verify a call site by reading it before you report it. If no local
@@ -353,6 +376,36 @@ If you can't answer the refutation, go check — or drop the finding. Dropping a
 finding costs nothing. Posting one costs the author's trust in every other finding you
 made.
 
+### 6b. Draft the PR description section
+
+Unless the user passed `--no-description`, draft a factual summary of what the PR
+changes. `pr_post.py` writes it at the top of the PR description under a
+"Summary of changes" heading, between hidden markers. The author's own description
+stays below it, untouched. On a rerun only that section is replaced. You write only
+the markdown that goes inside it; the script adds the heading, the markers and the
+"generated" note.
+
+What goes in it, scaled to the size of the PR (a one-line fix gets two lines):
+
+- **Overview**: one or two sentences on what the PR does. Give the reason only if the
+  author's text or commit messages state it. Never invent a motivation.
+- **Changes**: bullets grouped by area or module, naming the files or symbols
+  involved.
+- **Behaviour and contract changes**: API, event schema, config, env vars,
+  migrations, and callers outside the diff that are affected (from `impact.json`).
+  Leave the section out if there are none.
+- **Tests**: what tests were added or changed. Never say they pass unless `checks`
+  shows it.
+
+What stays out of it: findings, risks and criticism (those belong in the review), praise,
+and anything you did not see in the diff. Keep it under about 250 words.
+
+If `generated_description` exists, `generated_description_sha` equals `head_sha`, and
+the existing text is still accurate, reuse it verbatim so the description doesn't
+churn on a rerun with no new commits.
+
+### 6c. Print the summary
+
 Then print exactly this shape:
 
 ```
@@ -375,15 +428,27 @@ relevant: findings dropped by the self-check and why; callers outside the diff t
 `pr_impact.py` flagged; the count of `skipped_files`; low-severity findings held back
 by `--min-severity`; and whether CI was passing, failing, or absent.
 
-Then **stop and wait for approval**. Do not post anything yet. Accept `post`,
-`post 1 and 3`, `skip 2`, or `no`. With `--dry-run`, stop here permanently.
+After it, print the drafted description under a `PR description (will be added above
+the author's text):` heading, or `(will replace the section from the previous review)`
+if `generated_description` exists. Show it in full, since it will be visible to
+everyone on the PR.
+
+Then **stop and wait for approval**. Do not post anything yet. Accept `post` (comments
+and description), `post 1 and 3`, `skip 2`, `skip description`, `description only`, or
+`no`. Edits to the draft ("drop the Tests part") are fine too: apply them and show it
+again. With zero findings, still offer the description. With `--dry-run`, stop here
+permanently.
 
 ## Step 7 — Post
 
 Write the approved findings to `<workdir>/findings.json`:
 
 ```json
-{ "summary": "optional markdown for the review body", "findings": [ ... ] }
+{
+  "summary": "optional markdown for the review body",
+  "description": "the approved Step 6b draft; omit if skipped or --no-description",
+  "findings": [ ... ]
+}
 ```
 
 Then:
@@ -394,7 +459,8 @@ python <CORE>/scripts/pr_post.py <owner/repo> <number> \
     --min-severity warning
 ```
 
-(Add `--event` only if the user explicitly asked for `REQUEST_CHANGES` or `APPROVE`.)
+(Add `--event` only if the user explicitly asked for `REQUEST_CHANGES` or `APPROVE`,
+and `--no-description` if they turned the description off.)
 
 The script appends the fingerprint marker and a visible "AI-assisted review" line to
 every comment, enforces `duplicate_of_id` and the fingerprint check, validates each
@@ -402,10 +468,18 @@ line against the diff, posts one batched review, and falls back to posting comme
 comment if GitHub rejects the batch. Findings that cannot be anchored go into the
 review body in full, not just the title.
 
+For the description it re-reads the PR's current description right before writing,
+so edits the author made during the review are kept. It changes only the text between
+its own markers. If those markers were damaged (one deleted, or duplicated by a
+copy-paste), it leaves the description alone and reports `markers_damaged`. Never work
+around that by editing the description yourself.
+
 Report its JSON result plainly: how many posted, what was skipped and why (`fingerprint`
 vs `duplicate_of_id`), what failed, and the PR URL. If `unverified_duplicate_claims` is
-non-empty, mention it — you named an id that isn't on the PR, worth double-checking. If
-`failed` is non-empty, say so — do not report success.
+non-empty, mention it — you named an id that isn't on the PR, worth double-checking. Report
+`description.status` too: `added`, `updated`, `unchanged`, `markers_damaged`, or
+`failed` (with its `hint`: editing a description needs write access or PR authorship).
+If `failed` is non-empty, say so — do not report success.
 
 ## Step 8 — Clean up
 

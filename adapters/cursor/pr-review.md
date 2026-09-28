@@ -30,5 +30,7 @@ repo, and stop.
   anything. Reviewing the same PR twice must not repeat a comment.
 - Show the findings summary and **wait for the user's approval** before posting.
 - Anchor inline comments only to lines that appear in the diff.
+- Change the PR description only through `pr_post.py`, which rewrites nothing but
+  the skill's own marked section. Never alter or remove the author's text.
 - No style or formatting nits, and never restate what the code does.
 - Never `checkout`, `stash`, or `reset` in the user's working tree.
