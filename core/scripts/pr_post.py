@@ -126,7 +126,10 @@ def compose_body(f: dict, fp: str) -> str:
 
 
 def render_description_block(text: str, head_sha: str, author_text_follows: bool) -> str:
-    sha = (head_sha or "")[:12]
+    # Stored in full so it can be compared for equality against bundle.head_sha
+    # (see REVIEW.md's "generated_description_sha equals head_sha" check) --
+    # truncating it here made that comparison never match.
+    sha = head_sha or ""
     start = "<!-- pr-review-skill:description:start" + (f" sha={sha}" if sha else "") + " -->"
     parts = [
         start,
@@ -373,10 +376,18 @@ def main() -> int:
 
     if new_description is not None:
         try:
-            gh_with_input(
-                ["api", "--method", "PATCH", f"repos/{args.repo}/pulls/{args.number}", "--input", "-"],
-                json.dumps({"body": new_description}),
-            )
+            # Re-check right before writing: posting the review comments above can take
+            # a while, and the body was only read once, earlier. If the description
+            # changed in that window, don't overwrite it with a decision made from a
+            # now-stale read -- the author's edit wins.
+            latest_body = gh_json("api", f"repos/{args.repo}/pulls/{args.number}").get("body")
+            if (latest_body or "") != (pr.get("body") or ""):
+                result["description"] = {"status": "skipped_concurrent_edit"}
+            else:
+                gh_with_input(
+                    ["api", "--method", "PATCH", f"repos/{args.repo}/pulls/{args.number}", "--input", "-"],
+                    json.dumps({"body": new_description}),
+                )
         except GhError as exc:
             result["description"] = {
                 "status": "failed",
