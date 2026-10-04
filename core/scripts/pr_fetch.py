@@ -39,6 +39,7 @@ query($owner:String!,$name:String!,$number:Int!,$after:String){
       reviewThreads(first:100, after:$after){
         pageInfo{ hasNextPage endCursor }
         nodes{
+          id
           isResolved
           isOutdated
           path
@@ -363,7 +364,10 @@ def fetch_checks(repo: str, head_sha: str, max_annotations: int = 100) -> dict:
 
 
 def thread_state(owner: str, name: str, number: int) -> dict:
-    """databaseId of each review comment -> {resolved, outdated} of its thread."""
+    """databaseId of each review comment -> {resolved, outdated, thread_id} of its
+    thread. `thread_id` is the thread's own GraphQL node id -- the only thing GitHub's
+    `resolveReviewThread` mutation accepts, so pr_post.py needs it to ever mark one of
+    this skill's own threads resolved."""
     state: dict = {}
     after = None
     for _ in range(20):
@@ -386,6 +390,7 @@ def thread_state(owner: str, name: str, number: int) -> dict:
                 state[c["databaseId"]] = {
                     "resolved": bool(node["isResolved"]),
                     "outdated": bool(node["isOutdated"]),
+                    "thread_id": node.get("id"),
                 }
         if not threads["pageInfo"]["hasNextPage"]:
             break
@@ -549,6 +554,7 @@ def main() -> int:
             "anchored": c.get("position") is not None,
             "outdated": state.get("outdated", c.get("position") is None),
             "resolved": state.get("resolved", False),
+            "thread_id": state.get("thread_id"),
             "user": (c.get("user") or {}).get("login"),
             "in_reply_to_id": c.get("in_reply_to_id"),
             "created_at": c.get("created_at"),

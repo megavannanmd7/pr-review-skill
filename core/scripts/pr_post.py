@@ -19,10 +19,19 @@ written between two hidden markers at the top of the description, and the author
 text is kept exactly as it is below. A rerun rewrites only the text between the
 markers, so the section is replaced, never repeated.
 
+`resolved_threads` closes the loop the other way: a thread this skill posted earlier
+that a rerun now confirms is actually fixed. Every entry is re-verified here against
+the bundle before anything happens -- the comment id must be real, must carry this
+skill's own fingerprint (never someone else's thread), must not already be resolved,
+and must carry non-empty `evidence` -- an unverifiable or unevidenced request is
+skipped, not trusted. On success it posts a short confirming reply and calls GitHub's
+`resolveReviewThread` mutation; the two are independent best-effort steps and both
+outcomes are reported.
+
 Usage:
     python pr_post.py <owner/repo> <pr_number> --findings findings.json \
         [--bundle bundle.json] [--dry-run] [--min-severity warning] [--event COMMENT] \
-        [--no-description]
+        [--no-description] [--no-resolve]
 
 findings.json:
     {
@@ -43,6 +52,12 @@ findings.json:
           "suggestion": "optional replacement code for a ```suggestion block",
           "duplicate_of_id": "rc:123456789"   # optional: skip, this is the same
                                                # issue as an existing comment/review
+        }
+      ],
+      "resolved_threads": [
+        {
+          "comment_id": "rc:123456789",       # must be a comment this skill posted
+          "evidence": "null check added at line 41; the original trigger no longer applies"
         }
       ]
     }
@@ -70,7 +85,15 @@ from pr_fetch import (  # noqa: E402
 )
 
 MARKER_VERSION = 1
-DISCLAIMER = "> \U0001F916 *AI-assisted review, posted via the [pr-review skill](https://github.com/pr-review-skill) under this account's own login.*"
+
+RESOLVE_THREAD_MUTATION = """
+mutation($threadId:ID!){
+  resolveReviewThread(input:{threadId:$threadId}){
+    thread{ isResolved }
+  }
+}
+"""
+DISCLAIMER = "> \U0001F916 *AI-assisted review, posted via the [pr-review skill](https://github.com/megavannanmd7/pr-review-skill) under this account's own login.*"
 SEVERITY_ICON = {
     "blocker": "\U0001F534",
     "warning": "\U0001F7E1",
@@ -190,14 +213,38 @@ def existing_ids_from_bundle(bundle: dict) -> set:
     return ids
 
 
+def resolvable_threads_from_bundle(bundle: dict) -> dict:
+    """comment id (rc:...) -> {thread_id, resolved, fingerprints, path, line}, used to
+    verify a `resolved_threads` request before acting on it. Only available when a
+    --bundle was passed (pr_fetch.py is the only thing that runs the GraphQL thread
+    query this needs)."""
+    out = {}
+    for c in (bundle.get("existing") or {}).get("review_comments") or []:
+        if not c.get("id"):
+            continue
+        out[c["id"]] = {
+            "thread_id": c.get("thread_id"),
+            "resolved": bool(c.get("resolved")),
+            "fingerprints": c.get("fingerprints") or [],
+            "path": c.get("path"),
+            "line": c.get("line"),
+        }
+    return out
+
+
 def load_context(repo: str, number: int, bundle_path):
-    """Commentable lines per file, the head sha, fingerprints already on the PR, and
-    the set of existing comment/review ids a finding may cite as `duplicate_of_id`."""
+    """Commentable lines per file, the head sha, fingerprints already on the PR, the
+    set of existing comment/review ids a finding may cite as `duplicate_of_id`, and the
+    raw bundle (None unless --bundle was passed; resolving a thread needs the thread-id
+    map that only the bundle carries)."""
     if bundle_path:
         with open(bundle_path, encoding="utf-8") as fh:
             b = json.load(fh)
         commentable = {f["path"]: f["commentable"] for f in b["files"]}
-        return commentable, b["head_sha"], set(b.get("posted_fingerprints") or []), existing_ids_from_bundle(b)
+        return (
+            commentable, b["head_sha"], set(b.get("posted_fingerprints") or []),
+            existing_ids_from_bundle(b), b,
+        )
 
     pr = gh_json("api", f"repos/{repo}/pulls/{number}")
     commentable = {}
@@ -218,7 +265,7 @@ def load_context(repo: str, number: int, bundle_path):
         | {f"ic:{c['id']}" for c in issue_comments}
         | {f"rv:{r['id']}" for r in reviews}
     )
-    return commentable, pr["head"]["sha"], posted, existing_ids
+    return commentable, pr["head"]["sha"], posted, existing_ids, None
 
 
 def main() -> int:
@@ -240,13 +287,19 @@ def main() -> int:
         "--no-description", action="store_true",
         help="leave the PR description untouched even if findings.json has a description",
     )
+    ap.add_argument(
+        "--no-resolve", action="store_true",
+        help="leave existing threads alone even if findings.json has resolved_threads",
+    )
     args = ap.parse_args()
 
     with open(args.findings, encoding="utf-8") as fh:
         payload = json.load(fh)
     findings = payload.get("findings") or []
 
-    commentable, head_sha, already_posted, existing_ids = load_context(args.repo, args.number, args.bundle)
+    commentable, head_sha, already_posted, existing_ids, bundle = load_context(
+        args.repo, args.number, args.bundle
+    )
     min_rank = SEVERITY_RANK[args.min_severity]
 
     comments = []
@@ -360,12 +413,58 @@ def main() -> int:
             result["description"] = {"status": "failed", "error": str(exc)[:300]}
             result["failed"].append({"path": "<pr description>", "error": str(exc)[:300]})
 
+    # `resolved_threads`: findings.json may ask to mark some of this skill's own prior
+    # threads resolved. Every request is verified against the bundle before anything
+    # runs -- the id must be a real comment on this PR, it must carry this skill's own
+    # fingerprint marker (never resolve a thread it didn't post), it must not already
+    # be resolved, and the model must have supplied evidence. None of that is optional:
+    # an unverifiable or unevidenced request is skipped, not trusted.
+    resolve_requests = payload.get("resolved_threads") or []
+    resolve_plan = []
+    result["resolved_threads"] = {
+        "attempted": len(resolve_requests), "resolved": [], "skipped": [], "failed": [],
+    }
+    if args.no_resolve:
+        result["resolved_threads"]["status"] = "disabled"
+    elif resolve_requests and bundle is None:
+        result["resolved_threads"]["status"] = "no_bundle"
+        for r in resolve_requests:
+            result["resolved_threads"]["skipped"].append({
+                "comment_id": r.get("comment_id"),
+                "reason": "no --bundle was passed, cannot verify this request",
+            })
+    elif resolve_requests:
+        lookup = resolvable_threads_from_bundle(bundle)
+        for r in resolve_requests:
+            cid = r.get("comment_id")
+            evidence = (r.get("evidence") or "").strip()
+            info = lookup.get(cid)
+            reason = None
+            if info is None:
+                reason = "comment id not found on this PR"
+            elif not info["fingerprints"]:
+                reason = "not a comment this skill posted"
+            elif info["resolved"]:
+                reason = "already resolved"
+            elif not info["thread_id"]:
+                reason = "thread id unavailable (GraphQL thread lookup may have failed)"
+            elif not evidence:
+                reason = "no evidence given for why this is fixed"
+            if reason:
+                result["resolved_threads"]["skipped"].append({"comment_id": cid, "reason": reason})
+                continue
+            resolve_plan.append({
+                "comment_id": cid, "thread_id": info["thread_id"],
+                "path": info["path"], "line": info["line"], "evidence": evidence,
+            })
+
     if args.dry_run:
         result["dry_run"] = True
         result["preview"] = comments
         result["review_body"] = review_body
         if new_description is not None:
             result["description"]["preview"] = new_description
+        result["resolved_threads"]["would_resolve"] = resolve_plan
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
 
@@ -396,8 +495,50 @@ def main() -> int:
             }
             result["failed"].append({"path": "<pr description>", "error": str(exc)[:300]})
 
+    for item in resolve_plan:
+        resolve_thread(args, item, result)
+
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
+
+
+def resolve_thread(args, item: dict, result: dict) -> None:
+    """Reply confirming the fix, then mark the thread resolved via GraphQL.
+
+    The reply is a courtesy, not the mechanism -- resolution happens either way as long
+    as the mutation succeeds, so a reply failure alone doesn't block it. Both are best-
+    effort: either can fail independently, and both outcomes are reported rather than
+    silently swallowed, since a thread this skill claims to have resolved but didn't is
+    worse than one it left alone.
+    """
+    numeric_id = item["comment_id"].split(":", 1)[1]
+    reply_ok, reply_err = True, None
+    try:
+        reply = DISCLAIMER + "\n\n**Looks fixed** — " + item["evidence"]
+        gh_with_input(
+            ["api", "--method", "POST",
+             f"repos/{args.repo}/pulls/{args.number}/comments/{numeric_id}/replies",
+             "--input", "-"],
+            json.dumps({"body": reply}),
+        )
+    except GhError as exc:
+        reply_ok, reply_err = False, str(exc)[:300]
+
+    try:
+        gh_json(
+            "api", "graphql",
+            "-f", "query=" + RESOLVE_THREAD_MUTATION,
+            "-f", "threadId=" + item["thread_id"],
+        )
+        entry = {"comment_id": item["comment_id"], "path": item["path"], "line": item["line"]}
+        if not reply_ok:
+            entry["note"] = "resolved, but the confirming reply failed to post: " + (reply_err or "")
+        result["resolved_threads"]["resolved"].append(entry)
+    except GhError as exc:
+        result["resolved_threads"]["failed"].append({
+            "comment_id": item["comment_id"], "error": str(exc)[:300],
+            "note": "replied but could not resolve the thread" if reply_ok else "reply and resolve both failed",
+        })
 
 
 def post_review(args, review: dict, comments: list, review_body: str, head_sha: str, result: dict) -> None:
