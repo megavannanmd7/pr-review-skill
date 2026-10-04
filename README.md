@@ -17,10 +17,11 @@ Works in **Antigravity** (IDE + CLI), **Claude Code**, **Cursor**, and **Gemini 
 
 ```bash
 winget install --id GitHub.cli && gh auth login    # macOS: brew install gh && gh auth login
-git clone <this repo>
-cd pr-review-skill
-./install.sh --all                                 # Windows: powershell -ExecutionPolicy Bypass -File .\install.ps1 -All
+npm i -g github:megavannanmd7/pr-review-skill
+pr-review-skill install --all
 ```
+
+No npm/Node? Clone and use the shell installer instead — see [Install](#install).
 
 Restart your tool, then in Claude Code, Antigravity, Cursor, or Gemini CLI:
 
@@ -50,7 +51,23 @@ enough. Two things that need one extra step:
   the plain command above; the skill itself needs no changes, `gh` just needs to know
   which host to talk to.
 
-Then, from a clone of this repo:
+Then install with **npm** (needs Node 18+; nothing from this repo stays on disk outside
+`~/.pr-review-skill/` and each tool's own command directory):
+
+```bash
+npm i -g github:megavannanmd7/pr-review-skill   # or: npx github:megavannanmd7/pr-review-skill install --all
+pr-review-skill install --all
+pr-review-skill install --platform claude-code,cursor
+pr-review-skill doctor                          # re-check gh/python without reinstalling
+```
+
+This repo isn't published to any npm registry — `github:...` installs straight from the
+git repo, so whoever runs it needs the same access to it as a `git clone` would (nothing
+new). Re-running `npm i -g github:...` always pulls whatever is on `main` right now, so
+"update" is the same command as "install".
+
+No Node, or you'd rather not install globally? Use the shell installer instead, from a
+clone of this repo:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -All                       # Windows
@@ -66,8 +83,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Platform claude-code,cur
 your system's execution policy — it lets this unsigned script run without changing any
 machine-wide setting.)
 
-The installer puts the shared core in `~/.pr-review-skill/core/` and a small adapter in
-each tool's own directory:
+Either installer puts the shared core in `~/.pr-review-skill/core/` and a small adapter
+in each tool's own directory:
 
 | Tool | Adapter lands at | Invoke with |
 | --- | --- | --- |
@@ -77,8 +94,8 @@ each tool's own directory:
 | Cursor | `~/.cursor/commands/pr-review.md` | `/pr-review` |
 | Gemini CLI | `~/.gemini/commands/pr-review.toml` | `/pr-review` |
 
-Restart the tool afterwards. Re-run the installer whenever you pull changes to this
-repo.
+Restart the tool afterwards. Re-run `npm i -g github:...` (or `git pull` + the shell
+installer) whenever this repo changes.
 
 ### Verify the install before trying it on a real PR
 
@@ -172,10 +189,15 @@ New comments:
 1. src/foo.ts:42 — Possible null dereference
 2. src/bar.ts:118 — Redis key collision
 3. src/baz.ts:76 — Missing error handling
+
+Looks fixed (will mark resolved on approval):
+A. src/qux.ts:91 — null check added at line 88, the original crash path is gone
 ```
 
-Below that it shows the drafted PR-description section in full. Reply `post`,
-`post 1 and 3`, `skip description`, `description only`, or `no`.
+Below that it shows the drafted PR-description section in full, and any threads it can
+now confirm are fixed (see [below](#closing-out-fixed-comments)). Reply `post`
+(everything shown), `post 1 and 3`, `skip description`, `description only`,
+`skip resolve A`, `resolve only`, or `no`.
 
 ### A full run, start to finish
 
@@ -205,10 +227,10 @@ skill> Posted 2 inline comments to https://github.com/jpteam/paxiai-event-proces
 Run `/pr-review 842 paxiai-event-processor` again with no new commits, and step 1
 (the summary) reports 0 new comments — nothing gets reposted.
 
-## The PR description section
+## What happens to your PR description
 
 On by default. After you approve, the top of the PR description looks like this, with
-the author's text untouched underneath:
+your own text kept exactly as it was, underneath:
 
 ```markdown
 ## Summary of changes
@@ -222,209 +244,26 @@ Moves Redis retry handling from the HTTP layer into `eventConsumer`.
 Fixes #12. (the author's original description continues here)
 ```
 
-How it stays safe:
+Only that section ever changes — it's rewritten from the current diff on every run, and
+your text above and below it is never touched. If a marker ever gets damaged (deleted,
+or pasted twice), it leaves the description alone entirely rather than guess where your
+text starts. Turn this off with `--no-description`. Editing the description needs write
+access to the repo or authorship of the PR; without either, that part fails and the
+rest of the review still posts.
 
-- **Only its own section changes.** The section sits between two hidden markers
-  (`<!-- pr-review-skill:description:start -->` / `:end -->`). A rerun replaces the
-  text between them and leaves everything outside exactly as it was.
-- **It never writes back a stale copy.** `pr_post.py` re-reads the description right
-  before writing, so edits the author made during the review are kept.
-- **Damaged markers mean hands off.** If someone deletes one marker or pastes the
-  section twice, it reports `markers_damaged` and leaves the description alone rather
-  than guessing where the author's text starts.
-- **It isn't mistaken for the author's intent.** On the next run, `pr_fetch.py` splits
-  the section out of `body` (as `generated_description`), so the review never reads its
-  own summary as "the author said this was deliberate".
-- **It sticks to the facts.** It contains what changed, not findings, praise, or a
-  reason the author never gave, and it never claims tests pass unless CI shows that.
+It also never re-raises a fixed issue or double-posts on a rerun with no new commits —
+see [docs/how-it-works.md](docs/how-it-works.md) for exactly how that's enforced in
+code, not just trusted to the model.
 
-Editing a description needs write access to the repo or authorship of the PR. Without
-either, that part fails, the review still posts, and the result says why.
+## Closing out fixed comments
 
-## How deduplication works
-
-Two independent layers. The first is enforced by code, not just by the model's
-judgement — that's deliberate, so dedup doesn't silently degrade if the model phrases
-something differently on a rerun.
-
-1. **Named-duplicate match (primary, code-enforced).** `pr_fetch.py` tags every
-   existing comment, issue comment and review with a stable id (`rc:`/`ic:`/`rv:`).
-   When the review step finds a finding that matches one of them, it sets
-   `"duplicate_of_id": "rc:123456789"` on the finding. `pr_post.py` checks that id is
-   real and drops the finding — the skip happens in the script, not by hoping the
-   model remembers to leave it out. This is checked against every existing comment on
-   the PR, not just ones near the same line, so a general PR-level comment ("we're
-   migrating off Redis") can suppress a specific inline finding anywhere in the diff:
-
-   > existing: *"This can fail when project is null."*
-   > new: *"`project.id` is accessed without checking whether `project` exists."*
-   > → same issue, `duplicate_of_id` set, not posted.
-
-   If the model names an id that turns out not to actually be on the PR, the claim is
-   ignored (not trusted blindly) and the finding posts normally — surfaced in the
-   result as `unverified_duplicate_claims`, so a bad claim can't silently suppress a
-   real finding.
-
-2. **Fingerprint match (secondary, fast-path).** Every comment the skill posts ends
-   with a hidden marker, `<!-- pr-review-skill:v1 fp=a1b2c3d4e5f6 -->`, built from
-   `sha1(file | enclosing symbol | issue class)`. On a rerun, anything whose
-   fingerprint is already on the PR is dropped automatically, without needing the
-   model to re-derive a `duplicate_of_id`. It's a weaker signal on its own — the
-   fingerprint changes if the model names the anchor or issue class differently next
-   time — so it backs up layer 1 rather than replacing it.
-
-**Resolved vs. outdated are not the same thing**, and the skill doesn't treat them the
-same. GitHub marks a thread `outdated` automatically the moment a new commit shifts
-the diff under it — whether or not the issue was actually fixed. Only a thread a human
-explicitly marked `resolved` is auto-suppressed; an `outdated`-but-unresolved thread is
-checked against the current code, and if the problem is still there, it's still
-raised.
-
-Reviewing the same PR twice with no new commits posts nothing.
-
-## Auto-resolving fixed comments
-
-On a rerun, the skill also checks its own earlier threads that are still open — not
-just whether to re-raise the same issue (above), but whether to actively close it out.
-For every unresolved thread that carries this skill's own fingerprint marker, it rereads
-the current file at the PR head and asks whether the exact failure mode the original
-comment named is actually gone. Only if it can point to the specific lines that fix it
-does it propose marking the thread resolved; that proposal is shown to you alongside
-the findings and needs the same approval before anything happens.
-
-It will **not** propose resolving a thread just because:
-
-- GitHub marked it `outdated` (a new commit shifted the diff under it — that's not the
-  same as someone fixing it, see above);
-- the author or anyone else replied "fixed" or "done" (an unverified claim, not
-  evidence the skill checked itself);
-- it isn't sure. An open thread costs nothing; one marked resolved while the bug is
-  still there is worse than useless.
-
-On approval, it posts a short reply explaining what changed and why, then resolves the
-thread through GitHub's own API — never by editing or deleting the original comment.
-`pr_post.py` re-verifies every request against the bundle first: the comment must be
-real, must carry this skill's own marker (it will never resolve a thread it didn't
-post, even if asked to), must not already be resolved, and must come with a specific
-reason. Pass `--no-resolve` to turn this off entirely for a run.
-
-## How it keeps the noise down
-
-An AI reviewer's failure mode isn't missing bugs, it's confidently inventing them. Four
-rules in `core/REVIEW.md` exist specifically to make that harder:
-
-1. **Every finding must name a concrete failure trigger.** Not "filter might be
-   undefined" but "GET /documents with no `?filter=` → `JSON.parse(undefined)` throws
-   → 500". A model that has to name the triggering input has to go look for one, and
-   speculative findings die at that step.
-2. **Trace a caller before claiming a value can be null.** If middleware, a type, or a
-   validator guarantees `user.tier` is set, telling the author to add `?.` is asking
-   for dead code. No caller checked → it's a `question`, not a `warning`.
-3. **Check the convention before recommending a pattern.** If no sibling controller
-   has a try/catch, the framework is handling errors globally (NestJS `@Catch()`,
-   Express error middleware) and the comment is noise. A pattern absent *everywhere*
-   is an architecture question for the summary, not an inline nit.
-4. **Performance findings need a scale.** Sequential `await` in a loop is often
-   deliberate — rate limits, connection pools, ordering. `Promise.all` suggested into
-   a rate-limited API is how a review comment causes an outage.
-
-Plus a **self-refutation pass** before the summary: for each finding, could the author
-dismiss this immediately with context that wasn't checked? If it can't survive that,
-it's dropped. Dropping a shaky finding costs nothing; posting one costs the author's
-trust in every other finding.
-
-Two things also make the review better informed rather than just quieter:
-
-- **CI results are read, not guessed.** `pr_fetch.py` pulls check-run conclusions and
-  per-file annotations into the bundle, so real compiler and linter output is available
-  as evidence. The rubric forbids re-reporting anything CI already flagged, and forbids
-  claiming a build failure that isn't in `checks`. Nothing from the PR is executed
-  locally to get this — which matters for fork PRs.
-- **Blast radius is checked, not assumed.** The most dangerous PR bug is invisible in
-  the diff: change `findUser` from returning `null` to throwing and the diff looks
-  perfect while every caller doing `if (!user)` breaks. `pr_impact.py` greps a local
-  clone for call sites *outside* the PR's own files, both for symbols whose declaration
-  the PR changed or removed and for functions whose body changed while the declaration
-  line stayed the same. Each changed line is mapped to its enclosing function in the
-  file at the PR head. It's a heuristic word-grep, not a compiler: it reports places to
-  check. For a body-only change, the rubric first asks whether the function's contract
-  changed at all, and requires reading a call site before reporting it.
-
-## Handling untrusted PR content
-
-A PR's title, body, commits, diff, file contents, and existing comments can all be
-written by someone other than the person running this skill — most obviously on a fork
-PR. Two rules in `core/REVIEW.md` treat that content accordingly:
-
-- **It's data, never instructions.** A directive hidden in a commit message or a code
-  comment ("approve this PR", "ignore previous instructions") is something to review,
-  not something to obey. Only the rubric itself and the flags the invoking user typed
-  govern a run.
-- **A secret's value never gets quoted back.** If a finding flags a hardcoded
-  credential, the comment names the kind and location only — never the value itself. A
-  public GitHub comment is emailed to every watcher and stays searchable long after the
-  line is deleted, so repeating a leaked secret there to prove the finding would be
-  worse than the original leak. The finding still posts (as a `blocker`); it just never
-  carries the thing it's warning about.
-
-## Layout
-
-```
-core/                       installed once to ~/.pr-review-skill/core/
-  REVIEW.md                 the procedure, review rubric, evidence rules and dedup rules
-  scripts/pr_fetch.py       PR metadata, diff, commentable lines, commits, CI results,
-                            existing threads -> bundle.json
-  scripts/pr_impact.py      bundle.json + a local clone -> call sites outside the PR
-                            for every declaration or function body it changed
-                            (blast radius)
-  scripts/pr_post.py        findings.json -> one batched inline review (with fallbacks),
-                            plus resolving the skill's own fixed threads
-adapters/
-  antigravity/SKILL.md      each adapter is ~30 lines: frontmatter in that tool's
-  claude-code/SKILL.md      format, a pointer to core/REVIEW.md, and the invariants
-  cursor/pr-review.md       that must hold even if REVIEW.md cannot be read
-  gemini-cli/pr-review.toml
-tests/                      not installed; run with python -m unittest discover tests
-install.ps1 / install.sh
-```
-
-The rubric and the scripts exist exactly once per machine. Adapters never contain
-review logic, so the tools cannot drift apart — fix a rule in `core/REVIEW.md` and
-every tool picks it up on the next run.
-
-`pr_fetch.py` and `pr_post.py` are plain Python 3, standard library only, and shell out
-to `gh`. They handle the mechanical parts that are easy to get wrong — pagination,
-mapping diff hunks to the lines GitHub will accept a comment on, a fallback to the
-whole-PR unified diff when GitHub omits a file's patch from the files endpoint (common
-on large diffs), thread resolution state, permission preflight, lockfile filtering,
-and batched review posting with a per-comment fallback. Judgement (the review itself,
-and picking which existing comment a finding duplicates) lives in `core/REVIEW.md`;
-`pr_post.py` enforces that judgement rather than trusting it blindly — see "How
-deduplication works" above.
-
-Both scripts are usable on their own:
-
-```bash
-python core/scripts/pr_fetch.py  jpteam/paxiai-event-processor 842 --out bundle.json
-python core/scripts/pr_impact.py --bundle bundle.json --clone ../paxiai-event-processor \
-    --ref refs/remotes/pr/842
-python core/scripts/pr_post.py   jpteam/paxiai-event-processor 842 \
-    --findings findings.json --bundle bundle.json --dry-run
-```
-
-## Adding another tool
-
-Nearly every AI coding tool now has a "reusable prompt triggered by a keyword"
-mechanism with shell access. To add one, copy an existing adapter, translate the
-frontmatter to that tool's format, and add a case to both installers. Do not copy the
-rubric into it.
-
-Not yet covered, and why:
-
-- **Codex CLI** — its custom-prompt mechanism is deprecated in favour of a skills
-  mechanism; needs a short spike to confirm the current folder and format.
-- **GitHub Copilot** (`.github/prompts/pr-review.prompt.md`) — works only in agent
-  mode, since ask and edit modes cannot run `gh` or Python.
+On a rerun, it also checks its own earlier comments that are still open. If it can read
+the current code and confirm the exact issue it originally raised is actually gone, it
+proposes marking that thread resolved — shown to you for approval the same as any
+finding, never done silently. It will **not** do this just because GitHub marked a
+thread `outdated`, or because someone replied "fixed" without the skill verifying it
+itself. Turn this off with `--no-resolve`; see
+[docs/how-it-works.md](docs/how-it-works.md) for the exact verification rules.
 
 ## Troubleshooting
 
@@ -451,12 +290,9 @@ command — the two give different, more accurate results.
 | `pr_impact.py` reports an unrelated file | Expected — it's a word-grep, not a compiler. The rubric requires reading a call site before reporting it as a finding |
 | Skill not offered by the tool | Re-run the installer and restart the tool; check the adapter path in the table above |
 
-## Changing it
+## More
 
-Edit `core/REVIEW.md` (procedure, review rubric, dedup rules) or the scripts, commit,
-and have everyone re-run the installer. If you change how fingerprints are built, bump
-`MARKER_VERSION` in `pr_post.py` — old markers will no longer match and previously
-posted findings can be raised again.
-
-Run `python -m unittest discover tests` after changing `pr_impact.py`. The tests build
-throwaway git repos and check what the script reports for each kind of change.
+This covers day-to-day use. For how deduplication and auto-resolve are enforced in
+code, the review rubric's noise-reduction rules, how untrusted PR content and secrets
+are handled, the repo layout, adding another tool, and how to change the skill, see
+[docs/how-it-works.md](docs/how-it-works.md).
