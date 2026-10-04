@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 bundle.json
 findings.json
+node_modules/
